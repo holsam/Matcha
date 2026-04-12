@@ -37,6 +37,12 @@ def init_schema(db_path: str):
                 fingerprint TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS comparisons (
+                video_a_id  INTEGER NOT NULL REFERENCES videos(id),
+                video_b_id  INTEGER NOT NULL REFERENCES videos(id),
+                PRIMARY KEY (video_a_id, video_b_id)
+            );
+
             CREATE TABLE IF NOT EXISTS matches (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_a_id  INTEGER NOT NULL REFERENCES videos(id),

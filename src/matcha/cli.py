@@ -1,17 +1,43 @@
-import click
+import typer
+
 from .indexer import run_index
+from .matcher import run_match
+
+app = typer.Typer(help="Matcha — a video matching tool using perceptual hashing.")
 
 
-@click.group()
-def cli():
-    """Matcha — a video matching tool using perceptual hashing."""
-    pass
-
-
-@cli.command()
-@click.argument("directory", type=click.Path(exists=True, file_okay=False))
-@click.option("--fps", default=1.0, show_default=True, help="Frames per second to sample for hashing.")
-@click.option("--workers", default=4, show_default=True, help="Number of parallel indexing workers.")
-def index(directory, fps, workers):
+@app.command()
+def index(
+    directory: str = typer.Argument(..., help="Directory to index."),
+    fps: float = typer.Option(1.0, help="Frames per second to sample for hashing."),
+    workers: int = typer.Option(4, help="Number of parallel indexing workers."),
+):
     """Fingerprint all videos in DIRECTORY and store results in .matcha/index.db."""
     run_index(directory, fps=fps, workers=workers)
+
+
+@app.command()
+def match(
+    directory: str = typer.Argument(..., help="Directory to match."),
+    filter_length: bool = typer.Option(
+        False, "--filter-length",
+        help="Only compare pairs where one video is strictly longer than the other."
+    ),
+    window: float = typer.Option(10.0, help="Minimum match duration in seconds."),
+    frame_step: int = typer.Option(3, help="Step size when sliding the comparison window."),
+    threshold: int = typer.Option(10, help="Max Hamming distance to count a frame as matching (0–64)."),
+    min_confidence: float = typer.Option(0.8, help="Minimum match ratio to record a result (0.0–1.0)."),
+):
+    """Compare indexed videos and record matches in .matcha/index.db."""
+    run_match(
+        directory,
+        filter_length=filter_length,
+        window=window,
+        frame_step=frame_step,
+        threshold=threshold,
+        min_confidence=min_confidence,
+    )
+
+
+if __name__ == "__main__":
+    app()

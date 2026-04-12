@@ -1,4 +1,4 @@
-import click, os, threading, time
+import os, threading, time, typer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -88,7 +88,7 @@ def process_video(video_id: int, video_path: str, db_path: str, fps: float) -> s
             )
 
     except Exception as e:
-        click.echo(f"\n  [SKIP] {video_path}: {e}", err=True)
+        typer.echo(f"\n  [SKIP] {video_path}: {e}", err=True)
 
     return video_path
 
@@ -102,18 +102,18 @@ def run_index(directory: str, fps: float = 1.0, workers: int = 4):
 
     init_schema(db_path)
 
-    click.echo(f"Scanning {directory} for videos...")
+    typer.echo(f"Scanning {directory} for videos...")
     all_videos = find_videos(directory)
-    click.echo(f"Found {len(all_videos)} video(s).")
+    typer.echo(f"Found {len(all_videos)} video(s).")
 
     register_videos(db_path, all_videos)
 
     to_process = get_unprocessed(db_path)
     if not to_process:
-        click.echo("All videos already indexed. Nothing to do.")
+        typer.echo("All videos already indexed. Nothing to do.")
         return
 
-    click.echo(
+    typer.echo(
         f"Indexing {len(to_process)} unprocessed video(s) "
         f"with {workers} worker(s) at {fps}fps..."
     )
@@ -127,6 +127,6 @@ def run_index(directory: str, fps: float = 1.0, workers: int = 4):
         for future in as_completed(futures):
             future.result()
             completed += 1
-            click.echo(f"  [{completed}/{len(to_process)}] done")
+            typer.echo(f"  [{completed}/{len(to_process)}] done")
 
-    click.echo("Indexing complete.")
+    typer.echo("Indexing complete.")
