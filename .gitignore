@@ -1,0 +1,9 @@
+# Python caches
+__pycache__/
+.venv/
+
+# MacOS files
+.DS_Store
+
+# Local development files
+.docs/
