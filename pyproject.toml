@@ -1,6 +1,6 @@
 [project]
 name = "matcha"
-version = "0.1.1"
+version = "0.1.2"
 description = "A video matching tool using perceptual hashing."
 readme = "README.md"
 requires-python = ">=3.14"
@@ -12,4 +12,4 @@ dependencies = [
 ]
 
 [project.scripts]
-matcha = "matcha.cli:cli"
+matcha = "matcha.cli:app"
