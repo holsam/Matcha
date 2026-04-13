@@ -1,6 +1,6 @@
 [project]
 name = "matcha"
-version = "0.1.2"
+version = "0.2.0"
 description = "A video matching tool using perceptual hashing."
 readme = "README.md"
 requires-python = ">=3.14"
@@ -13,3 +13,10 @@ dependencies = [
 
 [project.scripts]
 matcha = "matcha.cli:app"
+
+[dependency-groups]
+dev = [
+    "opencv-python>=4.13.0.92",
+    "pytest>=9.0.3",
+    "tqdm>=4.67.3",
+]
