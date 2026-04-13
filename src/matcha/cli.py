@@ -2,6 +2,7 @@ import typer
 
 from .indexer import run_index
 from .matcher import run_match
+from .mover import run_move
 
 app = typer.Typer(help="Matcha — a video matching tool using perceptual hashing.")
 
@@ -38,6 +39,13 @@ def match(
         min_confidence=min_confidence,
     )
 
+@app.command()
+def move(
+    directory: str = typer.Argument(..., help="Directory to organise."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without moving any files."),
+):
+    """Move matched videos into sequentially numbered subdirectories under duplicates/."""
+    run_move(directory, dry_run=dry_run)
 
 if __name__ == "__main__":
     app()
