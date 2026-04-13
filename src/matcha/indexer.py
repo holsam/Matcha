@@ -1,6 +1,15 @@
-import os, threading, time, typer
-from concurrent.futures import ThreadPoolExecutor, as_completed
+"""
+matcha/indexer.py — Phase 1: walk, fingerprint, store.
+
+Uses ProcessPoolExecutor so that multiple ffmpeg subprocesses run in parallel
+without GIL contention. Each worker opens its own SQLite connection — connections
+are not safe to share across processes.
+"""
+
+import os, time, typer
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from tqdm import tqdm
 
 from .db import get_connection, init_schema
 from .fingerprint import (
@@ -9,15 +18,6 @@ from .fingerprint import (
     get_audio_fingerprint,
     get_video_duration,
 )
-
-# Thread-local DB connections — sqlite3 connections must not be shared across threads
-_local = threading.local()
-
-
-def _get_local_conn(db_path: str):
-    if not hasattr(_local, "conn"):
-        _local.conn = get_connection(db_path)
-    return _local.conn
 
 
 def find_videos(root: str) -> list[str]:
@@ -37,7 +37,7 @@ def register_videos(db_path: str, paths: list[str]):
     with conn:
         conn.executemany(
             "INSERT OR IGNORE INTO videos (path) VALUES (?)",
-            [(p,) for p in paths]
+            [(p,) for p in paths],
         )
 
 
@@ -50,13 +50,15 @@ def get_unprocessed(db_path: str) -> list[tuple[int, str]]:
     return [(row["id"], row["path"]) for row in rows]
 
 
-def process_video(video_id: int, video_path: str, db_path: str, fps: float) -> str:
+def process_video(args: tuple) -> tuple[str, str | None]:
     """
-    Fingerprint a single video and write results to the DB.
-    Returns the video path on completion (used for progress reporting).
-    Errors are caught and logged per-file so one bad file does not halt the run.
+    Worker function — runs in a subprocess.
+
+    Opens its own DB connection (connections cannot cross process boundaries).
+    Returns (video_path, error_message) where error_message is None on success.
     """
-    conn = _get_local_conn(db_path)
+    video_id, video_path, db_path, fps = args
+    conn = get_connection(db_path)
 
     try:
         duration = get_video_duration(video_path)
@@ -66,11 +68,11 @@ def process_video(video_id: int, video_path: str, db_path: str, fps: float) -> s
         with conn:
             conn.execute(
                 "UPDATE videos SET duration = ? WHERE id = ?",
-                (duration, video_id)
+                (duration, video_id),
             )
             conn.executemany(
                 "INSERT INTO frame_hashes (video_id, timestamp, phash) VALUES (?, ?, ?)",
-                [(video_id, ts, ph) for ts, ph in frame_hashes]
+                [(video_id, ts, ph) for ts, ph in frame_hashes],
             )
             if audio is not None:
                 audio_duration, fingerprint = audio
@@ -80,17 +82,16 @@ def process_video(video_id: int, video_path: str, db_path: str, fps: float) -> s
                         (video_id, duration, fingerprint)
                     VALUES (?, ?, ?)
                     """,
-                    (video_id, audio_duration, fingerprint)
+                    (video_id, audio_duration, fingerprint),
                 )
             conn.execute(
                 "UPDATE videos SET fingerprinted_at = ? WHERE id = ?",
-                (time.time(), video_id)
+                (time.time(), video_id),
             )
+        return video_path, None
 
     except Exception as e:
-        typer.echo(f"\n  [SKIP] {video_path}: {e}", err=True)
-
-    return video_path
+        return video_path, str(e)
 
 
 def run_index(directory: str, fps: float = 1.0, workers: int = 4):
@@ -113,20 +114,24 @@ def run_index(directory: str, fps: float = 1.0, workers: int = 4):
         typer.echo("All videos already indexed. Nothing to do.")
         return
 
-    typer.echo(
-        f"Indexing {len(to_process)} unprocessed video(s) "
-        f"with {workers} worker(s) at {fps}fps..."
-    )
+    typer.echo(f"Indexing {len(to_process)} video(s) with {workers} worker(s) at {fps}fps...")
 
-    completed = 0
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(process_video, vid_id, path, db_path, fps): path
-            for vid_id, path in to_process
-        }
-        for future in as_completed(futures):
-            future.result()
-            completed += 1
-            typer.echo(f"  [{completed}/{len(to_process)}] done")
+    args = [(vid_id, path, db_path, fps) for vid_id, path in to_process]
+    errors: list[str] = []
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(process_video, arg): arg for arg in args}
+        with tqdm(total=len(futures), unit="video", dynamic_ncols=True) as bar:
+            for future in as_completed(futures):
+                path, error = future.result()
+                bar.update(1)
+                bar.set_postfix_str(os.path.basename(path), refresh=False)
+                if error:
+                    errors.append(f"{path}: {error}")
+
+    if errors:
+        typer.echo(f"\n{len(errors)} video(s) failed:", err=True)
+        for msg in errors:
+            typer.echo(f"  [SKIP] {msg}", err=True)
 
     typer.echo("Indexing complete.")
