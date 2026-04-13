@@ -182,8 +182,8 @@ wheels = [
 
 [[package]]
 name = "matcha"
-version = "0.4.0"
-source = { virtual = "." }
+version = "1.0.0"
+source = { editable = "." }
 dependencies = [
     { name = "imagehash" },
     { name = "pillow" },
