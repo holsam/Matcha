@@ -24,7 +24,7 @@ matcha index <directory>   Fingerprint all videos and populate the index
 matcha match <directory>   Compare indexed videos and record matches
 matcha move  <directory>   Move matched videos into duplicates/ subdirectories
 ```
-All three subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. match and move are deliberately separate so you can review what Matcha found before anything is touched on disk. For more information on using the subcommands, see the relevant section of [Subcommand Usage](#subcommand-usage).
+All three subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. `match` and `move` are deliberately separate so you can review what Matcha found before anything is touched on disk. For more information on using the subcommands, see the relevant section of [Subcommand Usage](#subcommand-usage).
 
 ## Installation
 ### Dependencies
@@ -61,6 +61,8 @@ matcha --help
 |--------|---------|-------------|
 | `--fps`  | `1.0` | Frame sample rate for pHash extraction |
 | `--workers` | `4` | Parallel indexing workers |
+| `--no-audio` | n/a | Skip audio fingerprinting |
+| `--hwaccel` | n/a | Use GPU/hardware-accelerated decoding | 
 
 ```sh
 # Index a directory with defaults (1fps, 4 workers)
@@ -85,6 +87,8 @@ uv run matcha index /path/to/Videos
 5. Processes files in parallel using ThreadPoolExecutor
 
 Frames are written to a temp directory on disk rather than held in RAM. Peak memory per worker is one frame at a time (~1–5 MB depending on resolution), regardless of video length. With 4 workers running in parallel, frame data contributes roughly 20 MB total — negligible. The temp directory for each video is cleaned up automatically after processing, even if an error occurs.
+
+To improve speed, the `--no-audio` and `--hwaccel` flags can be used. The former will cause the audio fingerprinting used for validation be skipped, while the latter will offload frame decoding to the local machine's GPU (on Mac, this is via VideoToolbox).
 
 ### `matcha match`
 #### CLI options and usage

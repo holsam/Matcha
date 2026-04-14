@@ -12,9 +12,11 @@ def index(
     directory: str = typer.Argument(..., help="Directory to index."),
     fps: float = typer.Option(1.0, help="Frames per second to sample for hashing."),
     workers: int = typer.Option(4, help="Number of parallel indexing workers."),
+    no_audio: bool = typer.Option(False, "--no-audio", help="Skip audio fingerprinting."),
+    hwaccel: bool = typer.Option(False, "--hwaccel", help="Use hardware-accelerated decoding (VideoToolbox on Mac)."),
 ):
     """Fingerprint all videos in DIRECTORY and store results in .matcha/index.db."""
-    run_index(directory, fps=fps, workers=workers)
+    run_index(directory, fps=fps, workers=workers, no_audio=no_audio, hwaccel=hwaccel)
 
 
 @app.command()
