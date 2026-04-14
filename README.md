@@ -75,9 +75,9 @@ uv run matcha index /path/to/Videos
 #### Explanation
 1. Walks `<directory>` recursively for video files (.mp4, .mkv, .avi, .mov, .wmv, .flv, .webm), skipping the .matcha/ directory itself
 2. Registers each file in the videos table (skips if already present)
-3. Skips files that already have fingerprinted_at set — this is the checkpoint
+3. Skips files that already have fingerprinted_at set
 4. For each unprocessed file:
-    1. Extracts frames at a configurable rate (default: 1fps) into a temp directory on disk
+    1. Extracts frames at a configurable rate (default: 1fps) into a temp directory on disk, scaling them from high-resolution to reduce the decode overhead
     2. Computes a perceptual hash (pHash) for each frame immediately after writing, then deletes the frame file
     3. Attempts audio fingerprinting via Chromaprint; skips gracefully if no audio track is found
     4. Writes frame hashes and audio fingerprint to the DB
