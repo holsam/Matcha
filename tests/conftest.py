@@ -70,6 +70,15 @@ def indexed_dir(video_dir):
     run_index(str(video_dir["dir"]), fps=1.0, workers=2)
     return video_dir
 
+@pytest.fixture(scope="module")
+def indexed_dir_hwaccel(video_dir):
+    run_index(str(video_dir["dir"]), fps=1.0, workers=2, hwaccel=True)
+    return video_dir
+
+@pytest.fixture(scope="module")
+def indexed_dir_no_audio(video_dir):
+    run_index(str(video_dir["dir"]), fps=1.0, workers=2, hwaccel=True)
+    return video_dir
 
 @pytest.fixture(scope="module")
 def matched_dir(indexed_dir):
