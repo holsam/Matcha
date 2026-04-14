@@ -57,10 +57,10 @@ matcha --help
 ## Subcommand Usage
 ### `matcha index`
 #### CLI options and usage
-| Option | Command | Default | Description |
-|--------|---------|---------|-------------|
-| `--fps` | `index` | `1.0` | Frame sample rate for pHash extraction |
-| `--workers` | `index` | `4` | Parallel indexing workers |
+| Option  | Default | Description |
+|--------|---------|-------------|
+| `--fps`  | `1.0` | Frame sample rate for pHash extraction |
+| `--workers` | `4` | Parallel indexing workers |
 
 ```sh
 # Index a directory with defaults (1fps, 4 workers)
@@ -88,14 +88,14 @@ Frames are written to a temp directory on disk rather than held in RAM. Peak mem
 
 ### `matcha match`
 #### CLI options and usage
-| Option | Command | Default | Description |
-|--------|---------|---------|-------------|
-| `--filter-length` | `match` | off | Skip pairs with identical durations |
-| `--window` | `match` | `10.0` | Minimum duration (seconds) for a video to be compared |
-| `--frame-step` | `match` | `3` | Step size when sliding the comparison window |
-| `--threshold` | `match` | `10` | Max Hamming distance to count a frame pair as matching (0–64) |
-| `--min-confidence` | `match` | `0.8` | Minimum match ratio to record a result (0.0–1.0) |
-| `--workers` | `match` | `4` | Parallel comparison workers |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--filter-length` | off | Skip pairs with identical durations |
+| `--window` |  `10.0` | Minimum duration (seconds) for a video to be compared |
+| `--frame-step` |  `3` | Step size when sliding the comparison window |
+| `--threshold` |  `10` | Max Hamming distance to count a frame pair as matching (0–64) |
+| `--min-confidence` |  `0.8` | Minimum match ratio to record a result (0.0–1.0) |
+| `--workers` |  `4` | Parallel comparison workers |
 
 ```sh
 # Compare all indexed videos with defaults
@@ -128,9 +128,9 @@ A match is classified as:
 
 ### `matcha move`
 #### CLI options and usage
-| Option | Command | Default | Description |
-|--------|---------|---------|-------------|
-| `--dry-run` | `move` | off | Preview without moving any files |
+| Option | Default | Description |
+|--------- | --- |-------------|
+| `--dry-run` | off | Preview without moving any files |
 ```sh
 # Preview what would be moved
 uv run matcha move /path/to/Videos --dry-run
