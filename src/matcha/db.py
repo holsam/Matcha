@@ -17,7 +17,8 @@ def init_schema(db_path: str):
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 path             TEXT UNIQUE NOT NULL,
                 duration         REAL,
-                fingerprinted_at REAL
+                fingerprinted_at REAL,
+                moved_to         TEXT
             );
 
             CREATE TABLE IF NOT EXISTS frame_hashes (

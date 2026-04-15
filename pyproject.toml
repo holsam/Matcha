@@ -1,6 +1,6 @@
 [project]
 name = "matcha"
-version = "1.5.2"
+version = "1.5.3"
 description = "A video matching tool using perceptual hashing."
 readme = "README.md"
 requires-python = ">=3.14"
