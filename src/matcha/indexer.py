@@ -167,12 +167,13 @@ def run_index(
     if not to_process:
         console.print(f"[bold green]All videos already indexed![/bold green]\n")
         return
-
-    flags = (["no audio"] if no_audio else []) + (["hwaccel"] if hwaccel else [])
-    flag_str = f"  [{', '.join(flags)}]" if flags else ""
-    console.print(
-        f"\nIndexing configuration: {workers} worker(s), {fps}fps{flag_str}"
-    )
+    inv_audio = False if no_audio else True
+    console.print(f"Indexing configuration: {workers} worker(s), {fps}fps, hardware-acceleration={hwaccel}, audio fingerprinting={inv_audio}")
+    # flags = (["no audio"] if no_audio else []) + (["hwaccel"] if hwaccel else [])
+    # flag_str = f"  [{', '.join(flags)}]" if flags else ""
+    # console.print(
+    #     f"\nIndexing configuration: {workers} worker(s), {fps}fps{flag_str}"
+    # )
 
     args = [
         (vid_id, path, db_path, fps, no_audio, hwaccel)
