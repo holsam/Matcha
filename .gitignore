@@ -6,8 +6,12 @@ __pycache__/
 # MacOS files
 .DS_Store
 
-# Test files
+# Test files and caches
 tests/output_videos
+.pytest_cache/
+
+# Build artefacts
+dist/
 
 # Local development files
 .docs/
