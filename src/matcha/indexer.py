@@ -1,4 +1,4 @@
-import os, threading, time
+import os, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from rich.console import Console, Group
@@ -25,11 +25,13 @@ _id_lock = threading.Lock()
 _id_counter = 0
 _worker_status: dict[int, str | None] = {}
 _status_lock = threading.Lock()
+_stop_event = threading.Event()
 
 def _reset_worker_state():
     global _id_counter, _worker_status
     _id_counter = 0
     _worker_status = {}
+    _stop_event.clear()
 
 def _get_worker_id() -> int:
     global _id_counter
@@ -56,9 +58,13 @@ def _render(progress: Progress, num_workers: int) -> Group:
     """Progress bar + one dim status line per worker."""
     with _status_lock:
         snapshot = dict(_worker_status)
+    quitting = _stop_event.is_set()
     lines: list = [progress]
     for i in range(1, num_workers + 1):
-        label = snapshot.get(i) or "idle"
+        if quitting:
+            label = "quitting"
+        else:
+            label = snapshot.get(i) or "idle"
         lines.append(Text(f"  Worker {i}: {label}", style="dim"))
     return Group(*lines)
 
@@ -68,6 +74,16 @@ def _get_conn(db_path: str):
     if not hasattr(_thread_local_conn, "conn"):
         _thread_local_conn.conn = get_connection(db_path)
     return _thread_local_conn.conn
+
+def _rollback_video(conn, video_id: int):
+    """Remove all partial data written for a video that was interrupted mid-processing."""
+    with conn:
+        conn.execute("DELETE FROM frame_hashes WHERE video_id = ?", (video_id,))
+        conn.execute("DELETE FROM audio_fingerprints WHERE video_id = ?", (video_id,))
+        conn.execute(
+            "UPDATE videos SET duration = NULL, fingerprinted_at = NULL WHERE id = ?",
+            (video_id,),
+        )
 
 def find_videos(root: str) -> list[str]:
     videos = []
@@ -104,9 +120,23 @@ def process_video(args: tuple) -> tuple[str, str | None]:
     conn = _get_conn(db_path)
 
     try:
+        if _stop_event.is_set():
+            return video_path, "cancelled"
+
         duration = get_video_duration(video_path)
+
+        if _stop_event.is_set():
+            return video_path, "cancelled"
+
         frame_hashes = extract_frame_hashes(video_path, fps=fps, hwaccel=hwaccel)
+
+        if _stop_event.is_set():
+            return video_path, "cancelled"
+
         audio = None if no_audio else get_audio_fingerprint(video_path)
+
+        if _stop_event.is_set():
+            return video_path, "cancelled"
 
         with conn:
             conn.execute(
@@ -135,8 +165,42 @@ def process_video(args: tuple) -> tuple[str, str | None]:
         return video_path, None
 
     except Exception as e:
+        _rollback_video(conn, video_id)
         _set_status(None)
         return video_path, str(e)
+
+
+def _listen_for_quit():
+    """
+    Background thread that sets _stop_event when 'q' is pressed.
+    Works on Mac/Linux via termios, and Windows via msvcrt.
+    Degrades silently if neither is available.
+    """
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            while not _stop_event.is_set():
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch.lower() == "q":
+                        _stop_event.set()
+                        break
+                time.sleep(0.05)
+        else:
+            import termios, tty
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                while not _stop_event.is_set():
+                    ch = sys.stdin.read(1)
+                    if ch.lower() == "q":
+                        _stop_event.set()
+                        break
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    except Exception:
+        pass  # Not a TTY or unsupported platform — quit-on-q simply unavailable
 
 
 def run_index(
@@ -167,31 +231,55 @@ def run_index(
     if not to_process:
         console.print(f"[bold green]All videos already indexed![/bold green]\n")
         return
-    inv_audio = False if no_audio else True
-    console.print(f"Indexing configuration: {workers} worker(s), {fps}fps, hardware-acceleration={hwaccel}, audio fingerprinting={inv_audio}")
-    # flags = (["no audio"] if no_audio else []) + (["hwaccel"] if hwaccel else [])
-    # flag_str = f"  [{', '.join(flags)}]" if flags else ""
-    # console.print(
-    #     f"\nIndexing configuration: {workers} worker(s), {fps}fps{flag_str}"
-    # )
+    
+    console.print(f"Indexing configuration: {workers} worker(s), {fps}fps, hardware acceleration = {hwaccel}, audio fingerprinting = {not no_audio}"
+    )
+    console.print(f"[dim]Press [bold]q[/bold] to quit indexing before completion.[/dim]\n")
 
     args = [
         (vid_id, path, db_path, fps, no_audio, hwaccel)
         for vid_id, path in to_process
     ]
+
+    quit_thread = threading.Thread(target=_listen_for_quit, daemon=True)
+    quit_thread.start()
+
     errors: list[str] = []
     progress = _make_progress()
     task = progress.add_task("Indexing", total=len(args))
 
     with Live(_render(progress, workers), console=console, refresh_per_second=10) as live:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
             futures = {executor.submit(process_video, arg): arg for arg in args}
-            for future in as_completed(futures):
-                path, error = future.result()
-                progress.advance(task)
+            pending = set(futures.keys())
+            while pending:
+                done = {f for f in pending if f.done()}
+                for future in done:
+                    pending.remove(future)
+                    path, error = future.result()
+                    if error != "cancelled":
+                        progress.advance(task)
+                    if error:
+                        errors.append(f"{path}: {error}")
+
+                if _stop_event.is_set():
+                    for f in pending:
+                       f.cancel()
+                    live.update(_render(progress, workers))
+                    time.sleep(0.5)
+                    break
+
                 live.update(_render(progress, workers))
-                if error:
-                    errors.append(f"{path}: {error}")
+                time.sleep(0.05)
+
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    if _stop_event.is_set():
+        time.sleep(0.5)
+        console.print(f"\n[yellow]Indexing cancelled.[/yellow]\n")
+        sys.exit()
 
     if errors:
         console.print(f"\n[red]{len(errors)} video(s) failed:[/red]")
