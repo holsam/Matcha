@@ -62,12 +62,13 @@ def mark_group_moved(db_path: str, video_ids: list[int]):
         )
 
 
-def update_video_path(db_path: str, video_id: int, new_path: str):
+def record_moved_to(db_path: str, video_id: int, moved_to: str):
+    """Record the destination path without altering the original path."""
     conn = get_connection(db_path)
     with conn:
         conn.execute(
-            "UPDATE videos SET path = ? WHERE id = ?",
-            (new_path, video_id),
+            "UPDATE videos SET moved_to = ? WHERE id = ?",
+            (moved_to, video_id),
         )
 
 
@@ -133,7 +134,7 @@ def run_move(directory: str, dry_run: bool = False):
                 dst = os.path.join(group_dir, f"{name}_{vid_id}{ext}")
 
             shutil.move(src, dst)
-            update_video_path(db_path, vid_id, dst)
+            record_moved_to(db_path, vid_id, dst)
             videos_moved += 1
 
         mark_group_moved(db_path, list(group))
