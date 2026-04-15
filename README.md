@@ -18,13 +18,16 @@
 # Matcha
 Matcha is a CLI tool for finding duplicate and near-duplicate videos in a directory, including sub-clip detection across different qualities and lengths. It can be installed using the Python `uv` package manager as described in [Installation](#installation).
 
-Matcha provides three subcommands:
+Matcha provides several subcommands:
 ```sh
-matcha index <directory>   Fingerprint all videos and populate the index
-matcha match <directory>   Compare indexed videos and record matches
-matcha move  <directory>   Move matched videos into duplicates/ subdirectories
+matcha index   <directory>   Fingerprint all videos and populate the index
+matcha match   <directory>   Compare indexed videos and record matches
+matcha move    <directory>   Move matched videos into duplicates/ subdirectories
+matcha cleanup <directory>   Remove deleted files from index and return kept files to original location
+matcha sync    <directory>   Remove index entries for files missing from disk
 ```
-All three subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. `match` and `move` are deliberately separate so you can review what Matcha found before anything is touched on disk. For more information on using the subcommands, see the relevant section of [Subcommand Usage](#subcommand-usage).
+
+All subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. `match`, `move`, and `sync` all support --dry-run to preview changes before committing them. For more information on using the subcommands, see the relevant section of [Subcommand Usage](#subcommand-usage).
 
 ## Installation
 ### Dependencies
@@ -158,6 +161,46 @@ Numbering continues from where it left off — if duplicates/1/ and duplicates/2
 
 `matcha move` uses union-find as matches are stored as pairs, but groups can be larger. Union-find computes the transitive closure efficiently: it processes each pair in O(α(n)) time (effectively constant), so even a large match table resolves instantly.
 
+
+## `matcha cleanup`
+matcha/cleanup.py — Post-move maintenance.
+
+Walks each numbered subdirectory inside duplicates/ and checks whether any
+files have been removed by the user since the move. There are three outcomes
+for each subdirectory:
+
+  - All files still present  → skip (nothing to do)
+  - Exactly one file remains → return it to its original path and remove all
+                               DB entries for the deleted files
+  - Multiple files deleted   → remove DB entries for deleted files only;
+                               leave survivors in place
+
+"Return to original path" means moving the file back to the value stored in
+the `path` column of the videos table (the pre-move location). If that
+directory no longer exists, it is created.
+
+What it does
+Walks each numbered subdirectory inside duplicates/ and compares files present on disk against what the DB recorded in moved_to. Three outcomes per subdirectory:
+
+All files present → skip (user hasn't reviewed yet)
+One file remains → move it back to its original path, clear moved_to, reset the match's moved flag, remove DB entries for deleted files
+Multiple files deleted, multiple remain → remove DB entries for deleted files only; leave survivors in place
+
+
+## `matcha sync`
+matcha/sync.py — Remove index entries for files that no longer exist on disk.
+
+Checks every entry in the videos table against the filesystem. If the file
+is missing from its original `path` AND has no valid `moved_to` location,
+the entry and all associated data (frame hashes, audio fingerprint, match
+records, comparison records) are removed from the DB.
+
+Files that have been moved (moved_to is set and the file exists there) are
+left untouched — they are still present on disk, just in a different location.
+
+What it does
+Checks every entry in the videos table against the filesystem. A file is considered present if its path exists or its moved_to path exists. If neither is true, all associated records are removed from the DB. Supports --dry-run.
+
 ## Getting Help & Contributing
 If you come across any bugs/issues while using Matcha, or if you have a feature request, please open an issue [here][issues-url].
 
@@ -173,9 +216,10 @@ The SQLite database lives at `<target_dir>/.matcha/index.db`. It is created auto
 -- One row per video file
 CREATE TABLE IF NOT EXISTS videos (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    path             TEXT UNIQUE NOT NULL,   -- absolute path
+    path             TEXT UNIQUE NOT NULL,   -- original absolute path (never changed)
     duration         REAL,                   -- seconds
-    fingerprinted_at REAL                    -- unix timestamp; NULL = not yet done
+    fingerprinted_at REAL,                   -- unix timestamp; NULL = not yet done
+    moved_to         TEXT                    -- destination path after move; NULL = not moved
 );
 
 -- One row per sampled frame
