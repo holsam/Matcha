@@ -1,4 +1,4 @@
-import imagehash, itertools, os, sys, termios, threading, time, tty, typer
+import imagehash, io, itertools, os, sys, termios, threading, time, tty, typer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -144,10 +144,9 @@ def _watch_for_quit(stop_event: threading.Event):
     fd = sys.stdin.fileno()
     try:
         old_settings = termios.tcgetattr(fd)
-    except termios.error:
+    except (termios.error, io.UnsupportedOperation): 
         # stdin is not a tty (e.g. in tests or piped input) — skip listener
         return
-
     try:
         tty.setraw(fd)
         while not stop_event.is_set():
