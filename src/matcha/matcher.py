@@ -1,12 +1,5 @@
-"""
-matcha/matcher.py — Phase 2: pairwise comparison, sliding window.
-
-The CPU-bound sliding window comparisons run in a ProcessPoolExecutor.
-DB writes (recording comparisons and matches) happen on the main process
-after results are collected, keeping SQLite access single-threaded.
-"""
-import imagehash, itertools, os, time, typer
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import imagehash, itertools, os, sys, termios, threading, time, tty, typer
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from tqdm import tqdm
 
@@ -18,12 +11,9 @@ class VideoRecord:
     id: int
     path: str
     duration: float
-    frame_hashes: list[str]   # ordered by timestamp
     has_audio: bool
 
-
 def load_videos(db_path: str) -> list[VideoRecord]:
-    """Load all fully indexed videos and their frame hashes from the DB."""
     conn = get_connection(db_path)
     audio_ids = {
         row["video_id"]
@@ -32,30 +22,31 @@ def load_videos(db_path: str) -> list[VideoRecord]:
     rows = conn.execute(
         "SELECT id, path, duration FROM videos WHERE fingerprinted_at IS NOT NULL"
     ).fetchall()
-    videos = []
-    for row in rows:
-        hash_rows = conn.execute(
-            "SELECT phash FROM frame_hashes WHERE video_id = ? ORDER BY timestamp",
-            (row["id"],),
-        ).fetchall()
-        videos.append(VideoRecord(
+    return [
+        VideoRecord(
             id=row["id"],
             path=row["path"],
             duration=row["duration"] or 0.0,
-            frame_hashes=[r["phash"] for r in hash_rows],
             has_audio=row["id"] in audio_ids,
-        ))
-    return videos
+        )
+        for row in rows
+    ]
+
+
+def load_frame_hashes(db_path: str, video_id: int) -> list[str]:
+    """Fetch frame hashes for a single video. Called per-pair inside the worker."""
+    conn = get_connection(db_path)
+    rows = conn.execute(
+        "SELECT phash FROM frame_hashes WHERE video_id = ? ORDER BY timestamp",
+        (video_id,),
+    ).fetchall()
+    return [row["phash"] for row in rows]
 
 
 def generate_pairs(
     videos: list[VideoRecord],
     filter_length: bool,
 ) -> list[tuple[VideoRecord, VideoRecord]]:
-    """
-    Generate (shorter, longer) pairs to compare.
-    If filter_length is True, skip pairs where both videos have identical durations.
-    """
     pairs = []
     for a, b in itertools.combinations(videos, 2):
         if filter_length and a.duration == b.duration:
@@ -66,7 +57,6 @@ def generate_pairs(
 
 
 def get_compared_pairs(db_path: str) -> set[tuple[int, int]]:
-    """Return the set of (lower_id, higher_id) pairs already compared."""
     conn = get_connection(db_path)
     rows = conn.execute("SELECT video_a_id, video_b_id FROM comparisons").fetchall()
     return {(row["video_a_id"], row["video_b_id"]) for row in rows}
@@ -98,10 +88,8 @@ def record_match(
             (short.id, long.id, match_type, confidence, time.time()),
         )
 
-
 def hamming_distance(hash_a: str, hash_b: str) -> int:
     return imagehash.hex_to_hash(hash_a) - imagehash.hex_to_hash(hash_b)
-
 
 def sliding_window_match(
     short_hashes: list[str],
@@ -109,16 +97,10 @@ def sliding_window_match(
     frame_step: int,
     threshold: int,
 ) -> float:
-    """
-    Slide a window the size of short_hashes across long_hashes.
-    Returns the best match ratio found (0.0–1.0).
-    """
     n = len(short_hashes)
     m = len(long_hashes)
-
     if n == 0 or m < n:
         return 0.0
-
     best_ratio = 0.0
     for start in range(0, m - n + 1, frame_step):
         matches = sum(
@@ -129,7 +111,6 @@ def sliding_window_match(
         ratio = matches / n
         if ratio > best_ratio:
             best_ratio = ratio
-
     return best_ratio
 
 
@@ -141,15 +122,45 @@ def determine_match_type(short: VideoRecord, long: VideoRecord) -> str:
 
 def _compare_pair(args: tuple) -> tuple[int, int, float]:
     """
-    Worker function — runs in a subprocess.
-
-    Takes a pre-serialised tuple of IDs, hashes, and settings.
-    Returns (short_id, long_id, confidence).
+    Worker — fetches frame hashes from the DB and runs the sliding window.
+    Hash lists are not passed in; they are loaded here and discarded after,
+    keeping peak memory to one pair at a time per thread.
     """
-    short_id, long_id, short_hashes, long_hashes, frame_step, threshold = args
+    short_id, long_id, db_path, frame_step, threshold = args
+    short_hashes = load_frame_hashes(db_path, short_id)
+    long_hashes = load_frame_hashes(db_path, long_id)
     confidence = sliding_window_match(short_hashes, long_hashes, frame_step, threshold)
     return short_id, long_id, confidence
 
+
+def _watch_for_quit(stop_event: threading.Event):
+    """
+    Background thread that sets stop_event when 'q' is pressed.
+
+    Puts stdin into raw (unbuffered, no-echo) mode so keypresses are
+    received immediately without the user pressing Enter. Restores the
+    original terminal settings on exit regardless of how it ends.
+    """
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        # stdin is not a tty (e.g. in tests or piped input) — skip listener
+        return
+
+    try:
+        tty.setraw(fd)
+        while not stop_event.is_set():
+            # os.read is non-blocking after setraw; use select to avoid busy-wait
+            import select
+            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if readable:
+                ch = os.read(fd, 1)
+                if ch in (b"q", b"Q"):
+                    stop_event.set()
+                    break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 def run_match(
     directory: str,
@@ -168,12 +179,12 @@ def run_match(
         typer.echo("No index found. Run `matcha index` first.")
         raise SystemExit(1)
 
+    typer.echo("Loading index...")
     videos = load_videos(db_path)
     if not videos:
         typer.echo("No indexed videos found. Run `matcha index` first.")
         return
 
-    # Build a lookup so we can retrieve VideoRecords by ID after the pool returns
     video_map: dict[int, VideoRecord] = {v.id: v for v in videos}
 
     all_pairs = generate_pairs(videos, filter_length)
@@ -184,7 +195,6 @@ def run_match(
         if (min(s.id, l.id), max(s.id, l.id)) not in already_compared
     ]
 
-    # Separate out pairs that are too short to compare — mark them immediately
     eligible, too_short = [], []
     for short, long in pairs_to_run:
         if short.duration < window:
@@ -199,9 +209,8 @@ def run_match(
                f"({skipped_checkpoint} already done, {len(too_short)} too short)")
     if filter_length:
         typer.echo("Length filter: on")
-    typer.echo("")
+    typer.echo("Press 'q' to stop matching early.\n")
 
-    # Mark too-short pairs as compared without running the window
     for short, long in too_short:
         record_comparison(db_path, short.id, long.id)
 
@@ -209,18 +218,30 @@ def run_match(
         typer.echo("No eligible pairs to compare.")
         return
 
-    # Build args for the worker — pass only what can be pickled
     worker_args = [
-        (s.id, l.id, s.frame_hashes, l.frame_hashes, frame_step, threshold)
+        (s.id, l.id, db_path, frame_step, threshold)
         for s, l in eligible
     ]
 
     matches_found = 0
+    stopped_early = False
+    stop_event = threading.Event()
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
+    quit_thread = threading.Thread(target=_watch_for_quit, args=(stop_event,), daemon=True)
+    quit_thread.start()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_compare_pair, arg): arg for arg in worker_args}
         with tqdm(total=len(futures), unit="pair", dynamic_ncols=True) as bar:
             for future in as_completed(futures):
+                if stop_event.is_set():
+                    # Cancel all queued futures — in-flight ones finish but
+                    # their results are not consumed, so they remain unrecorded
+                    for f in futures:
+                        f.cancel()
+                    stopped_early = True
+                    break
+
                 short_id, long_id, confidence = future.result()
                 short = video_map[short_id]
                 long = video_map[long_id]
@@ -238,6 +259,11 @@ def run_match(
 
                 bar.update(1)
 
-    typer.echo(f"\nDone. {matches_found} match(es) found from {len(eligible)} comparison(s).")
-    if matches_found:
-        typer.echo("Run `matcha move` to organise matched files into duplicates/.")
+    stop_event.set()  # signal quit thread to exit if matching finished normally
+
+    if stopped_early:
+        typer.echo("\nStopped early. Progress has been saved — resume with `matcha match`.")
+    else:
+        typer.echo(f"\nDone. {matches_found} match(es) found from {len(eligible)} comparison(s).")
+        if matches_found:
+            typer.echo("Run `matcha move` to organise matched files into duplicates/.")
