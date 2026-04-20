@@ -1,12 +1,29 @@
 import sqlite3
+import threading
+
+# One connection per (db_path, thread) — avoids exhausting file descriptors by reusing connections rather than opening a new one on every call.
+_local = threading.local()
 
 
 def get_connection(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")  # safe for concurrent writes
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    """
+    Return a cached SQLite connection for the current thread and db_path.
+
+    Opening a new connection on every call leaks file descriptors — with
+    hundreds of pairs being compared this quickly hits the OS limit. Caching
+    per thread keeps the descriptor count bounded to (workers x db_count).
+    """
+    if not hasattr(_local, "conns"):
+        _local.conns = {}
+
+    if db_path not in _local.conns:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        _local.conns[db_path] = conn
+
+    return _local.conns[db_path]
 
 
 def init_schema(db_path: str):
