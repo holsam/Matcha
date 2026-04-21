@@ -70,4 +70,34 @@ def init_schema(db_path: str):
                 found_at    REAL NOT NULL,
                 moved       INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS faiss_index_meta (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),  -- enforce single row
+                built_at        REAL,                                -- unix timestamp
+                vector_count    INTEGER                              -- total hashes indexed
+            );
+
+            CREATE TABLE IF NOT EXISTS candidate_pairs (
+                video_a_id  INTEGER NOT NULL REFERENCES videos(id),
+                video_b_id  INTEGER NOT NULL REFERENCES videos(id),
+                generated   INTEGER NOT NULL DEFAULT 0,   -- 1 once Pass 1 has emitted this pair
+                PRIMARY KEY (video_a_id, video_b_id)
+            );
         """)
+
+def get_faiss_meta(db_path: str) -> dict | None:
+    conn = get_connection(db_path)
+    row = conn.execute("SELECT * FROM faiss_index_meta WHERE id = 1").fetchone()
+    return dict(row) if row else None
+
+
+def set_faiss_meta(db_path: str, vector_count: int):
+    import time
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute("""
+            INSERT INTO faiss_index_meta (id, built_at, vector_count)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET built_at = excluded.built_at,
+                                          vector_count = excluded.vector_count
+        """, (time.time(), vector_count))

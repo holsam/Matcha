@@ -1,17 +1,33 @@
 import imagehash, io, itertools, os, sys, termios, threading, time, tty, typer
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from tqdm import tqdm
 
 from .db import get_connection
-
+from .faiss_index import build_index, find_candidate_pairs
 
 @dataclass
 class VideoRecord:
     id: int
     path: str
     duration: float
+    frame_hashes: list[str]
     has_audio: bool
+
+def _print_message(stage: str, msg: str):
+    ts = datetime.now().strftime('%H:%M:%S')
+    tab = stage.count('.')
+    print_msg = f'\t'*tab+f'[{stage}] ({ts}) {msg}'
+    typer.echo(print_msg)
+
+
+def _hex_to_uint64(hex_str: str) -> int:
+    return int(hex_str, 16)
+
+def _hamming_uint64(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
 
 def load_videos(db_path: str) -> list[VideoRecord]:
     conn = get_connection(db_path)
@@ -22,15 +38,20 @@ def load_videos(db_path: str) -> list[VideoRecord]:
     rows = conn.execute(
         "SELECT id, path, duration FROM videos WHERE fingerprinted_at IS NOT NULL"
     ).fetchall()
-    return [
-        VideoRecord(
+    videos = []
+    for row in rows:
+        hash_rows = conn.execute(
+            "SELECT phash FROM frame_hashes WHERE video_id = ? ORDER BY timestamp",
+            (row["id"],),
+        ).fetchall()
+        videos.append(VideoRecord(
             id=row["id"],
             path=row["path"],
             duration=row["duration"] or 0.0,
+            frame_hashes=[r["phash"] for r in hash_rows],
             has_audio=row["id"] in audio_ids,
-        )
-        for row in rows
-    ]
+        ))
+    return videos
 
 
 def load_frame_hashes(db_path: str, video_id: int) -> list[str]:
@@ -69,7 +90,6 @@ def record_comparison(db_path: str, id_a: int, id_b: int):
             "INSERT OR IGNORE INTO comparisons (video_a_id, video_b_id) VALUES (?, ?)",
             (min(id_a, id_b), max(id_a, id_b)),
         )
-
 
 def record_match(
     db_path: str,
@@ -113,6 +133,44 @@ def sliding_window_match(
             best_ratio = ratio
     return best_ratio
 
+def sliding_window_match_numpy(
+    short_hashes: list[str],
+    long_hashes: list[str],
+    frame_step: int,
+    threshold: int,
+) -> float:
+    """
+    Vectorised sliding window using NumPy, converts hex pHash strings to uint64 integers once, then computes Hamming distances across all window positions in batch using XOR + popcount.
+    """
+    n = len(short_hashes)
+    m = len(long_hashes)
+    if n == 0 or m < n:
+        return 0.0
+    # Convert hex strings → uint64 arrays once
+    short_ints = np.array([_hex_to_uint64(h) for h in short_hashes], dtype=np.uint64)
+    long_ints  = np.array([_hex_to_uint64(h) for h in long_hashes],  dtype=np.uint64)
+    # Precompute popcount lookup table for uint8 values (0–255)
+    popcount_table = np.zeros(256, dtype=np.uint8)
+    for i in range(256):
+        popcount_table[i] = bin(i).count("1")
+    def popcount_array(arr: np.ndarray) -> np.ndarray:
+        """Popcount each uint64 element via byte decomposition."""
+        # View as uint8 → 8 bytes per element → sum popcount per group of 8
+        as_bytes = arr.view(np.uint8).reshape(-1, 8)
+        return popcount_table[as_bytes].sum(axis=1).astype(np.int32)
+    best_ratio = 0.0
+    positions = range(0, m - n + 1, frame_step)
+    for start in positions:
+        window = long_ints[start : start + n]
+        xor = np.bitwise_xor(short_ints, window)
+        distances = popcount_array(xor)
+        match_count = int(np.sum(distances <= threshold))
+        ratio = match_count / n
+        if ratio > best_ratio:
+            best_ratio = ratio
+            if best_ratio == 1.0:
+                break  # can't improve further
+    return best_ratio
 
 def determine_match_type(short: VideoRecord, long: VideoRecord) -> str:
     if long.duration == 0:
@@ -126,10 +184,8 @@ def _compare_pair(args: tuple) -> tuple[int, int, float]:
     Hash lists are not passed in; they are loaded here and discarded after,
     keeping peak memory to one pair at a time per thread.
     """
-    short_id, long_id, db_path, frame_step, threshold = args
-    short_hashes = load_frame_hashes(db_path, short_id)
-    long_hashes = load_frame_hashes(db_path, long_id)
-    confidence = sliding_window_match(short_hashes, long_hashes, frame_step, threshold)
+    short_id, long_id, short_hashes, long_hashes, frame_step, threshold = args
+    confidence = sliding_window_match_numpy(short_hashes, long_hashes, frame_step, threshold)
     return short_id, long_id, confidence
 
 
@@ -169,66 +225,92 @@ def run_match(
     threshold: int = 10,
     min_confidence: float = 0.8,
     workers: int = 4,
+    nprobe: int = 32,
 ):
     """Main entry point for the match subcommand."""
     directory = os.path.abspath(directory)
-    db_path = os.path.join(directory, ".matcha", "index.db")
+    index_dir = os.path.join(directory, ".matcha")
+    db_path = os.path.join(index_dir, "index.db")
 
     if not os.path.exists(db_path):
         typer.echo("No index found. Run `matcha index` first.")
         raise SystemExit(1)
 
-    typer.echo("Loading index...")
+    _print_message('1', 'Loading index...')
     videos = load_videos(db_path)
     if not videos:
-        typer.echo("No indexed videos found. Run `matcha index` first.")
+        _print_message('1', 'No indexed videos found. Run `matcha index` first.')
         return
-
     video_map: dict[int, VideoRecord] = {v.id: v for v in videos}
-
-    all_pairs = generate_pairs(videos, filter_length)
+    _print_message('1', 'Index loaded.')
+    # Pass 1
+    _print_message('2', 'Pass 1: generating candidates via FAISS...')
+    _print_message('2.1', 'Rebuilding FAISS index...')
+    rebuilt = build_index(db_path, index_dir, nprobe)
+    if not rebuilt:
+        _print_message('2.1', 'FAISS index already up to date.')
+    conn = get_connection(db_path)
+    existing_candidates: set[tuple[int, int]] = {
+        (row['video_a_id'], row['video_b_id']) for row in conn.execute('SELECT video_a_id, video_b_id FROM candidate_pairs').fetchall()
+    }
+    _print_message('2.2', 'Loaded existing candidates')
+    _print_message('2.3', 'Querying index for candidate pairs...')
+    new_candidates = find_candidate_pairs(db_path, index_dir, threshold, nprobe)
+    all_candidates = existing_candidates | new_candidates
+    new_to_write = new_candidates - existing_candidates
+    if new_to_write:
+        _print_message('2.4', 'Writing new candidates to index...')
+        with conn:
+            conn.executemany(
+                'INSERT OR IGNORE INTO candidate_pairs (video_a_id, video_b_id) VALUES (?, ?)',
+                list(new_to_write),
+            )
+        _print_message('2.4', 'Wrote new candidates to index.')
+        _print_message('2.5', f'{len(all_candidates):,} candidate pairs identified.')
+    # Pass 2
+    _print_message('3', 'Pass 2: comparing candidate pairs...')
     already_compared = get_compared_pairs(db_path)
-
-    pairs_to_run = [
-        (s, l) for s, l in all_pairs
-        if (min(s.id, l.id), max(s.id, l.id)) not in already_compared
-    ]
-
-    eligible, too_short = [], []
-    for short, long in pairs_to_run:
+    pairs_to_run: list[tuple[VideoRecord, VideoRecord]] = []
+    too_short: list[tuple[VideoRecord, VideoRecord]] = []
+    skipped = 0
+    _print_message('3.1', 'Starting candidate checks...')
+    for a_id, b_id in all_candidates:
+        if (a_id, b_id) in already_compared or (b_id, a_id) in already_compared:
+            skipped += 1
+            continue
+        a = video_map.get(a_id)
+        b = video_map.get(b_id)
+        if a is None or b is None:
+            continue
+        if filter_length and a.duration == b.duration:
+            continue
+        short, long = (a, b) if a.duration <= b.duration else (b, a)
         if short.duration < window:
             too_short.append((short, long))
         else:
-            eligible.append((short, long))
-
-    skipped_checkpoint = len(all_pairs) - len(pairs_to_run)
-
-    typer.echo(f"Videos indexed:    {len(videos)}")
-    typer.echo(f"Pairs to compare:  {len(eligible)}  "
-               f"({skipped_checkpoint} already done, {len(too_short)} too short)")
+            pairs_to_run.append((short, long))
+    _print_message('3.1', 'All candidates checked.')
+    _print_message('3.2', 'Pass 2 pair numbers')
+    _print_message('3.2.1', f'Pairs to verify: {len(pairs_to_run)}')
+    _print_message('3.2.2', f'Already compared: {skipped}')
+    _print_message('3.3.3', f'Too short to check: {len(too_short)}')
+    for short, long in too_short:
+        record_comparison(db_path, short.id, long.id)
+    if not pairs_to_run:
+        _print_message('3.3', 'No eligible pairs to verify')
+        return
+    worker_args = [
+        (s.id, l.id, s.frame_hashes, l.frame_hashes, frame_step, threshold)
+        for s, l in pairs_to_run
+    ]
     if filter_length:
         typer.echo("Length filter: on")
     typer.echo("Press 'q' to stop matching early.\n")
-
-    for short, long in too_short:
-        record_comparison(db_path, short.id, long.id)
-
-    if not eligible:
-        typer.echo("No eligible pairs to compare.")
-        return
-
-    worker_args = [
-        (s.id, l.id, db_path, frame_step, threshold)
-        for s, l in eligible
-    ]
-
     matches_found = 0
     stopped_early = False
     stop_event = threading.Event()
-
     quit_thread = threading.Thread(target=_watch_for_quit, args=(stop_event,), daemon=True)
     quit_thread.start()
-
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_compare_pair, arg): arg for arg in worker_args}
         with tqdm(total=len(futures), unit="pair", dynamic_ncols=True) as bar:
@@ -240,13 +322,10 @@ def run_match(
                         f.cancel()
                     stopped_early = True
                     break
-
                 short_id, long_id, confidence = future.result()
                 short = video_map[short_id]
                 long = video_map[long_id]
-
                 record_comparison(db_path, short_id, long_id)
-
                 if confidence >= min_confidence:
                     match_type = determine_match_type(short, long)
                     record_match(db_path, short, long, match_type, confidence)
@@ -255,14 +334,11 @@ def run_match(
                         f"  MATCH  {match_type:<10}  {confidence:.0%}  "
                         f"{os.path.basename(short.path)}  ←  {os.path.basename(long.path)}"
                     )
-
                 bar.update(1)
-
     stop_event.set()  # signal quit thread to exit if matching finished normally
-
     if stopped_early:
         typer.echo("\nStopped early. Progress has been saved — resume with `matcha match`.")
     else:
-        typer.echo(f"\nDone. {matches_found} match(es) found from {len(eligible)} comparison(s).")
+        typer.echo(f"\nDone. {matches_found} match(es) found from {len(pairs_to_run)} comparison(s).")
         if matches_found:
             typer.echo("Run `matcha move` to organise matched files into duplicates/.")
