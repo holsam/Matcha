@@ -33,9 +33,16 @@ def match(
     nprobe: int = typer.Option(32, help='FAISS IVF cells to prove (increasing nprobe increases accuracy and runtime).')
 ):
     """Compare indexed videos and record matches in .matcha/index.db."""
-    run_match(directory, filter_length=filter_length, window=window,
-              frame_step=frame_step, threshold=threshold,
-              min_confidence=min_confidence, workers=workers)
+    run_match(
+        directory, 
+        filter_length=filter_length,
+        window=window,
+        frame_step=frame_step,
+        threshold=threshold,
+        min_confidence=min_confidence,
+        workers=workers,
+        nprobe=nprobe
+    )
 
 
 @app.command()
