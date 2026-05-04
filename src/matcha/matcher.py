@@ -3,6 +3,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from rich import print
 from tqdm import tqdm
 
 from .db import get_connection
@@ -18,9 +19,9 @@ class VideoRecord:
 
 def _print_message(stage: str, msg: str):
     ts = datetime.now().strftime('%H:%M:%S')
-    tab = stage.count('.')
-    print_msg = f'\t'*tab+f'[{stage}] ({ts}) {msg}'
-    typer.echo(print_msg)
+    tab = stage.count('.') + 1
+    print_msg = f'({ts})'+'\t'*tab+f'{msg}'
+    print(f'[dim]{print_msg}[/dim]')
 
 
 def _hex_to_uint64(hex_str: str) -> int:
@@ -236,26 +237,26 @@ def run_match(
         typer.echo("No index found. Run `matcha index` first.")
         raise SystemExit(1)
 
+    print(f"\n:tea: [bold green]Matcha[/bold green]")
+    print(f"Matching videos in [cyan]{directory}[/cyan] by perceptual hashes...")
     _print_message('1', 'Loading index...')
     videos = load_videos(db_path)
     if not videos:
         _print_message('1', 'No indexed videos found. Run `matcha index` first.')
         return
     video_map: dict[int, VideoRecord] = {v.id: v for v in videos}
-    _print_message('1', 'Index loaded.')
     # Pass 1
-    _print_message('2', 'Pass 1: generating candidates via FAISS...')
-    _print_message('2.1', 'Rebuilding FAISS index...')
+    _print_message('2', 'Starting Pass 1 (candidate generation)...')
+    _print_message('2.1', 'Checking FAISS index state...')
     rebuilt = build_index(db_path, index_dir, nprobe)
     if not rebuilt:
-        _print_message('2.1', 'FAISS index already up to date.')
+        _print_message('2.1', 'FAISS index up to date.')
     conn = get_connection(db_path)
     existing_candidates: set[tuple[int, int]] = {
         (row['video_a_id'], row['video_b_id']) for row in conn.execute('SELECT video_a_id, video_b_id FROM candidate_pairs').fetchall()
     }
-    _print_message('2.2', 'Loaded existing candidates')
-    _print_message('2.3', 'Querying index for candidate pairs...')
-    new_candidates = find_candidate_pairs(db_path, index_dir, threshold, nprobe)
+    _print_message('2.3', 'Querying FAISS index for candidate pairs...')
+    new_candidates = find_candidate_pairs(db_path, index_dir, threshold, nprobe, workers)
     all_candidates = existing_candidates | new_candidates
     new_to_write = new_candidates - existing_candidates
     if new_to_write:
@@ -265,15 +266,14 @@ def run_match(
                 'INSERT OR IGNORE INTO candidate_pairs (video_a_id, video_b_id) VALUES (?, ?)',
                 list(new_to_write),
             )
-        _print_message('2.4', 'Wrote new candidates to index.')
-        _print_message('2.5', f'{len(all_candidates):,} candidate pairs identified.')
+        _print_message('2', f'{len(all_candidates):,} candidate pairs identified.')
     # Pass 2
-    _print_message('3', 'Pass 2: comparing candidate pairs...')
+    _print_message('3', 'Starting Pass 2 (candidate comparisons)...')
     already_compared = get_compared_pairs(db_path)
     pairs_to_run: list[tuple[VideoRecord, VideoRecord]] = []
     too_short: list[tuple[VideoRecord, VideoRecord]] = []
     skipped = 0
-    _print_message('3.1', 'Starting candidate checks...')
+    _print_message('3.1', 'Verifying candidates...')
     for a_id, b_id in all_candidates:
         if (a_id, b_id) in already_compared or (b_id, a_id) in already_compared:
             skipped += 1
@@ -289,8 +289,8 @@ def run_match(
             too_short.append((short, long))
         else:
             pairs_to_run.append((short, long))
-    _print_message('3.1', 'All candidates checked.')
-    _print_message('3.2', 'Pass 2 pair numbers')
+    _print_message('3.1', 'All candidates verified.')
+    _print_message('3.2', 'Pass 2 pairs:')
     _print_message('3.2.1', f'Pairs to verify: {len(pairs_to_run)}')
     _print_message('3.2.2', f'Already compared: {skipped}')
     _print_message('3.3.3', f'Too short to check: {len(too_short)}')
