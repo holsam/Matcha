@@ -1,6 +1,9 @@
 import faiss, os, typer
-from datetime import datetime
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from tqdm import tqdm
+from threading import Lock
 
 from .db import get_connection, get_faiss_meta, set_faiss_meta
 
@@ -11,12 +14,11 @@ _DEFAULT_NLIST = 100
 # How many IVF cells to probe at query time (higher = more accurate but slower).
 DEFAULT_NPROBE = 32
 
-
 def _print_message(stage: str, msg: str):
     ts = datetime.now().strftime('%H:%M:%S')
-    tab = stage.count('.')
-    print_msg = f'\t'*tab+f'[{stage}] ({ts}) {msg}'
-    typer.echo(print_msg)
+    tab = stage.count('.') + 1
+    print_msg = f'({ts})'+'\t'*tab+f'{msg}'
+    print(f'[dim]{print_msg}[/dim]')
 
 def _hex_to_bytes(hex_str: str) -> bytes:
     """Convert a 16-character hex pHash string to 8 packed bytes."""
@@ -46,6 +48,24 @@ def _load_all_hashes(db_path: str) -> tuple[np.ndarray, np.ndarray]:
     id_map = np.array(id_map_rows, dtype=np.int64)
     return vectors, id_map
 
+def _query_batch(args: tuple) -> set[tuple[int, int]]:
+    """Process a single batch of queries. Returns candidate pairs found in this batch."""
+    batch, batch_vids, index, id_map, k, threshold = args
+    distances, labels = index.search(batch, k)
+    pairs = set()
+    for i, (dists, lbls) in enumerate(zip(distances, labels)):
+        query_vid = int(batch_vids[i])
+        for dist, lbl in zip(dists, lbls):
+            if lbl < 0:
+                continue
+            if dist > threshold:
+                continue
+            candidate_vid = int(id_map[lbl, 0])
+            if candidate_vid == query_vid:
+                continue
+            pair = (min(query_vid, candidate_vid), max(query_vid, candidate_vid))
+            pairs.add(pair)
+    return pairs
 
 def build_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
     """
@@ -87,19 +107,19 @@ def load_index(index_dir: str) -> tuple[faiss.IndexBinaryIVF, np.ndarray]:
     id_map = np.load(map_path)
     return index, id_map
 
-
 def find_candidate_pairs(
     db_path: str,
     index_dir: str,
     threshold: int = 10,
-    nprobe: int = DEFAULT_NPROBE,
+    nprobe: int = 32,
     batch_size: int = 10_000,
+    workers: int = 4,
 ) -> set[tuple[int, int]]:
     """
-    Query the FAISS index to find (video_a_id, video_b_id) candidate pairs whose frame hashes are within `threshold` Hamming distance of each other. Uses batched querying so memory usage stays bounded regardless of dataset size.
+    Query the FAISS index to find candidate pairs using multiple threads.
     """
+    _print_message('2.3.1','Loading index...')
     index, id_map = load_index(index_dir)
-    _print_message('2.3.1', 'Loaded FAISS index.')
     index.nprobe = nprobe
     conn = get_connection(db_path)
     all_hashes_rows = conn.execute("""
@@ -107,35 +127,30 @@ def find_candidate_pairs(
         FROM frame_hashes
         ORDER BY video_id, timestamp
     """).fetchall()
-    _print_message('2.3.2', 'Retrieved video ids and phashes.')
     if not all_hashes_rows:
         return set()
+    _print_message('2.3.2','Retrieved videos and perceptual hashes...')
     vectors = np.array(
         [list(_hex_to_bytes(r["phash"])) for r in all_hashes_rows], dtype=np.uint8
     )
-    _print_message('2.3.3', 'Created vector list array.')
     query_video_ids = np.array([r["video_id"] for r in all_hashes_rows], dtype=np.int64)
-    _print_message('2.3.4', 'Created video id array.')
-    candidate_pairs: set[tuple[int, int]] = set()
-    _print_message('2.3.5', 'Created candidate pair set.')
-    _print_message('2.3.6', f'{len(vectors)} vectors to search using batch size {batch_size}')
-    k = 16  # number of nearest neighbours to retrieve per query frame
+    k = 16  # number of nearest neighbours per query frame
+    # Prepare batch arguments
+    _print_message('2.3.3','Defining batches...')
+    batch_args = []
     for start in range(0, len(vectors), batch_size):
         batch = vectors[start : start + batch_size]
         batch_vids = query_video_ids[start : start + batch_size]
-        # distances shape: (batch, k), labels shape: (batch, k)
-        distances, labels = index.search(batch, k)
-        for i, (dists, lbls) in enumerate(zip(distances, labels)):
-            query_vid = int(batch_vids[i])
-            for dist, lbl in zip(dists, lbls):
-                if lbl < 0:
-                    continue  # FAISS returns -1 for unfilled slots
-                if dist > threshold:
-                    continue
-                candidate_vid = int(id_map[lbl, 0])
-                if candidate_vid == query_vid:
-                    continue  # skip self
-                pair = (min(query_vid, candidate_vid), max(query_vid, candidate_vid))
-                candidate_pairs.add(pair)
-        _print_message('2.3.7', f'Vectors {start+batch_size}/{len(vectors)} queried.')
+        batch_args.append((batch, batch_vids, index, id_map, k, threshold))
+    candidate_pairs: set[tuple[int, int]] = set()
+    _print_message('2.3.4','Starting pair queries...')
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for batch_result in tqdm(
+            executor.map(_query_batch, batch_args),
+            total=len(batch_args),
+            desc="Querying FAISS index",
+            unit="batch",
+            dynamic_ncols=True,
+        ):
+            candidate_pairs.update(batch_result)
     return candidate_pairs
