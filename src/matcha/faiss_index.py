@@ -1,7 +1,7 @@
 import faiss, os, typer
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from tqdm import tqdm
 from threading import Lock
 
@@ -15,7 +15,7 @@ _DEFAULT_NLIST = 100
 DEFAULT_NPROBE = 32
 
 def _print_message(stage: str, msg: str):
-    ts = datetime.now().strftime('%H:%M:%S')
+    ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
     tab = stage.count('.') + 1
     print_msg = f'({ts})'+'\t'*tab+f'{msg}'
     print(f'[dim]{print_msg}[/dim]')
