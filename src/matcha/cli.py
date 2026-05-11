@@ -1,10 +1,11 @@
 import typer
 
-from .indexer import run_index
-from .matcher import run_match
-from .mover import run_move
-from .cleanup import run_cleanup
-from .sync import run_sync
+from matcha.cleanup import run_cleanup
+from matcha.continuer import run_continue
+from matcha.indexer import run_index
+from matcha.matcher import run_match
+from matcha.mover import run_move
+from matcha.sync import run_sync
 
 app = typer.Typer(help="Matcha — a video matching tool using perceptual hashing.")
 
@@ -64,6 +65,17 @@ def cleanup(
     subdirectory, returns it to its original location.
     """
     run_cleanup(directory)
+
+
+@app.command()
+def continue_(
+    directory: str = typer.Argument(".", help="Directory to continue from.",),
+    command: str | None = typer.Argument(None, help="Command to continue: 'index' or 'match'.",),
+):
+    """
+    Re-run the last index or match command using the same configuration.
+    """
+    run_continue(directory, command)
 
 
 @app.command()
