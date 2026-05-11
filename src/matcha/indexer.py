@@ -9,9 +9,9 @@ from rich.progress import (
 )
 from rich.text import Text
 
-
-from .db import get_connection, init_schema
-from .fingerprint import (
+from matcha.config import save_run_config
+from matcha.db import get_connection, init_schema
+from matcha.fingerprint import (
     VIDEO_EXTENSIONS,
     extract_frame_hashes,
     get_audio_fingerprint,
@@ -212,6 +212,13 @@ def run_index(
 ):
     _reset_worker_state()
     directory = os.path.abspath(directory)
+    matcha_dir = os.path.join(directory, ".matcha")
+    save_run_config(matcha_dir, "index", {
+        "fps": fps,
+        "workers": workers,
+        "no_audio": no_audio,
+        "hwaccel": hwaccel,
+    })
     db_dir = os.path.join(directory, ".matcha")
     os.makedirs(db_dir, exist_ok=True)
     db_path = os.path.join(db_dir, "index.db")

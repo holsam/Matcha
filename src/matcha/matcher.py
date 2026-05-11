@@ -2,12 +2,13 @@ import imagehash, io, itertools, os, sys, termios, threading, time, tty, typer
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from rich import print
 from tqdm import tqdm
 
-from .db import get_connection
-from .faiss_index import build_index, find_candidate_pairs
+from matcha.config import save_run_config
+from matcha.db import get_connection
+from matcha.faiss_index import build_index, find_candidate_pairs
 
 @dataclass
 class VideoRecord:
@@ -18,7 +19,7 @@ class VideoRecord:
     has_audio: bool
 
 def _print_message(stage: str, msg: str):
-    ts = datetime.now().strftime('%H:%M:%S')
+    ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
     tab = stage.count('.') + 1
     print_msg = f'({ts})'+'\t'*tab+f'{msg}'
     print(f'[dim]{print_msg}[/dim]')
@@ -230,6 +231,17 @@ def run_match(
 ):
     """Main entry point for the match subcommand."""
     directory = os.path.abspath(directory)
+    matcha_dir = os.path.join(directory, ".matcha")
+    save_run_config(matcha_dir, "match", {
+        "filter_length": filter_length,
+        "window": window,
+        "frame_step": frame_step,
+        "threshold": threshold,
+        "min_confidence": min_confidence,
+        "workers": workers,
+        "nprobe": nprobe,
+    })
+
     index_dir = os.path.join(directory, ".matcha")
     db_path = os.path.join(index_dir, "index.db")
 
