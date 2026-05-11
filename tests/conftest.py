@@ -26,8 +26,8 @@ def video_dir():
     # Load manifest
     import csv
 
-    exact_pair = None
-    partial_pair = None
+    exact_pair = []
+    partial_pair = []
     all_videos = []
 
     with open(manifest) as f:
@@ -39,10 +39,10 @@ def video_dir():
 
             all_videos.extend([a, b])
 
-            if rel == "exact" and exact_pair is None:
-                exact_pair = (a, b)
-            elif rel == "partial" and partial_pair is None:
-                partial_pair = (a, b)
+            if rel == "exact":
+                exact_pair.extend([a, b])
+            elif rel == "partial":
+                partial_pair.extend([a, b])
 
     # Deduplicate
     all_videos = list(set(all_videos))
@@ -70,6 +70,15 @@ def indexed_dir(video_dir):
     run_index(str(video_dir["dir"]), fps=1.0, workers=2)
     return video_dir
 
+@pytest.fixture(scope="module")
+def indexed_dir_hwaccel(video_dir):
+    run_index(str(video_dir["dir"]), fps=1.0, workers=2, hwaccel=True)
+    return video_dir
+
+@pytest.fixture(scope="module")
+def indexed_dir_no_audio(video_dir):
+    run_index(str(video_dir["dir"]), fps=1.0, workers=2, hwaccel=True)
+    return video_dir
 
 @pytest.fixture(scope="module")
 def matched_dir(indexed_dir):

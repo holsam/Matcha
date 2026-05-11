@@ -96,12 +96,12 @@ class TestMoving:
 
 
 class TestDBUpdates:
-    def test_paths_updated_in_db(self, move_dir):
+    def test_moved_to_paths_updated_in_db(self, move_dir):
         run_move(str(move_dir["dir"]))
         conn = get_connection(move_dir["db_path"])
-        paths = {r["path"] for r in conn.execute("SELECT path FROM videos").fetchall()}
-        duplicates_str = str(move_dir["dir"] / "duplicates")
-        assert sum(1 for p in paths if duplicates_str in p) >= 2
+        moved_files = [str(file) for file in (move_dir["dir"] / "duplicates").rglob("*") if file.is_file()]
+        moved_paths = {r["moved_to"] for r in conn.execute("SELECT moved_to FROM videos").fetchall() if r["moved_to"] is not None}
+        assert sorted(moved_files) == sorted(moved_paths)
 
     def test_matches_marked_as_moved(self, move_dir):
         run_move(str(move_dir["dir"]))

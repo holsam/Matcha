@@ -18,13 +18,16 @@
 # Matcha
 Matcha is a CLI tool for finding duplicate and near-duplicate videos in a directory, including sub-clip detection across different qualities and lengths. It can be installed using the Python `uv` package manager as described in [Installation](#installation).
 
-Matcha provides three subcommands:
+Matcha provides several subcommands:
 ```sh
-matcha index <directory>   Fingerprint all videos and populate the index
-matcha match <directory>   Compare indexed videos and record matches
-matcha move  <directory>   Move matched videos into duplicates/ subdirectories
+matcha index   <directory>   Fingerprint all videos and populate the index
+matcha match   <directory>   Compare indexed videos and record matches
+matcha move    <directory>   Move matched videos into duplicates/ subdirectories
+matcha cleanup <directory>   Remove deleted files from index and return kept files to original location
+matcha sync    <directory>   Remove index entries for files missing from disk
 ```
-All three subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. match and move are deliberately separate so you can review what Matcha found before anything is touched on disk. For more information on using the subcommands, see the relevant section of [Subcommand Usage](#subcommand-usage).
+
+All subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. `match`, `move`, and `sync` all support --dry-run to preview changes before committing them. For more information on using the subcommands, see the relevant section of [Subcommand Usage](#subcommand-usage).
 
 ## Installation
 ### Dependencies
@@ -57,10 +60,12 @@ matcha --help
 ## Subcommand Usage
 ### `matcha index`
 #### CLI options and usage
-| Option | Command | Default | Description |
-|--------|---------|---------|-------------|
-| `--fps` | `index` | `1.0` | Frame sample rate for pHash extraction |
-| `--workers` | `index` | `4` | Parallel indexing workers |
+| Option  | Default | Description |
+|--------|---------|-------------|
+| `--fps`  | `1.0` | Frame sample rate for pHash extraction |
+| `--workers` | `4` | Parallel indexing workers |
+| `--no-audio` | n/a | Skip audio fingerprinting |
+| `--hwaccel` | n/a | Use GPU/hardware-accelerated decoding | 
 
 ```sh
 # Index a directory with defaults (1fps, 4 workers)
@@ -75,9 +80,9 @@ uv run matcha index /path/to/Videos
 #### Explanation
 1. Walks `<directory>` recursively for video files (.mp4, .mkv, .avi, .mov, .wmv, .flv, .webm), skipping the .matcha/ directory itself
 2. Registers each file in the videos table (skips if already present)
-3. Skips files that already have fingerprinted_at set — this is the checkpoint
+3. Skips files that already have fingerprinted_at set
 4. For each unprocessed file:
-    1. Extracts frames at a configurable rate (default: 1fps) into a temp directory on disk
+    1. Extracts frames at a configurable rate (default: 1fps) into a temp directory on disk, scaling them from high-resolution to reduce the decode overhead
     2. Computes a perceptual hash (pHash) for each frame immediately after writing, then deletes the frame file
     3. Attempts audio fingerprinting via Chromaprint; skips gracefully if no audio track is found
     4. Writes frame hashes and audio fingerprint to the DB
@@ -86,16 +91,18 @@ uv run matcha index /path/to/Videos
 
 Frames are written to a temp directory on disk rather than held in RAM. Peak memory per worker is one frame at a time (~1–5 MB depending on resolution), regardless of video length. With 4 workers running in parallel, frame data contributes roughly 20 MB total — negligible. The temp directory for each video is cleaned up automatically after processing, even if an error occurs.
 
+To improve speed, the `--no-audio` and `--hwaccel` flags can be used. The former will cause the audio fingerprinting used for validation be skipped, while the latter will offload frame decoding to the local machine's GPU (on Mac, this is via VideoToolbox).
+
 ### `matcha match`
 #### CLI options and usage
-| Option | Command | Default | Description |
-|--------|---------|---------|-------------|
-| `--filter-length` | `match` | off | Skip pairs with identical durations |
-| `--window` | `match` | `10.0` | Minimum duration (seconds) for a video to be compared |
-| `--frame-step` | `match` | `3` | Step size when sliding the comparison window |
-| `--threshold` | `match` | `10` | Max Hamming distance to count a frame pair as matching (0–64) |
-| `--min-confidence` | `match` | `0.8` | Minimum match ratio to record a result (0.0–1.0) |
-| `--workers` | `match` | `4` | Parallel comparison workers |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--filter-length` | off | Skip pairs with identical durations |
+| `--window` |  `10.0` | Minimum duration (seconds) for a video to be compared |
+| `--frame-step` |  `3` | Step size when sliding the comparison window |
+| `--threshold` |  `10` | Max Hamming distance to count a frame pair as matching (0–64) |
+| `--min-confidence` |  `0.8` | Minimum match ratio to record a result (0.0–1.0) |
+| `--workers` |  `4` | Parallel comparison workers |
 
 ```sh
 # Compare all indexed videos with defaults
@@ -128,9 +135,9 @@ A match is classified as:
 
 ### `matcha move`
 #### CLI options and usage
-| Option | Command | Default | Description |
-|--------|---------|---------|-------------|
-| `--dry-run` | `move` | off | Preview without moving any files |
+| Option | Default | Description |
+|--------- | --- |-------------|
+| `--dry-run` | off | Preview without moving any files |
 ```sh
 # Preview what would be moved
 uv run matcha move /path/to/Videos --dry-run
@@ -154,6 +161,46 @@ Numbering continues from where it left off — if duplicates/1/ and duplicates/2
 
 `matcha move` uses union-find as matches are stored as pairs, but groups can be larger. Union-find computes the transitive closure efficiently: it processes each pair in O(α(n)) time (effectively constant), so even a large match table resolves instantly.
 
+
+## `matcha cleanup`
+matcha/cleanup.py — Post-move maintenance.
+
+Walks each numbered subdirectory inside duplicates/ and checks whether any
+files have been removed by the user since the move. There are three outcomes
+for each subdirectory:
+
+  - All files still present  → skip (nothing to do)
+  - Exactly one file remains → return it to its original path and remove all
+                               DB entries for the deleted files
+  - Multiple files deleted   → remove DB entries for deleted files only;
+                               leave survivors in place
+
+"Return to original path" means moving the file back to the value stored in
+the `path` column of the videos table (the pre-move location). If that
+directory no longer exists, it is created.
+
+What it does
+Walks each numbered subdirectory inside duplicates/ and compares files present on disk against what the DB recorded in moved_to. Three outcomes per subdirectory:
+
+All files present → skip (user hasn't reviewed yet)
+One file remains → move it back to its original path, clear moved_to, reset the match's moved flag, remove DB entries for deleted files
+Multiple files deleted, multiple remain → remove DB entries for deleted files only; leave survivors in place
+
+
+## `matcha sync`
+matcha/sync.py — Remove index entries for files that no longer exist on disk.
+
+Checks every entry in the videos table against the filesystem. If the file
+is missing from its original `path` AND has no valid `moved_to` location,
+the entry and all associated data (frame hashes, audio fingerprint, match
+records, comparison records) are removed from the DB.
+
+Files that have been moved (moved_to is set and the file exists there) are
+left untouched — they are still present on disk, just in a different location.
+
+What it does
+Checks every entry in the videos table against the filesystem. A file is considered present if its path exists or its moved_to path exists. If neither is true, all associated records are removed from the DB. Supports --dry-run.
+
 ## Getting Help & Contributing
 If you come across any bugs/issues while using Matcha, or if you have a feature request, please open an issue [here][issues-url].
 
@@ -169,9 +216,10 @@ The SQLite database lives at `<target_dir>/.matcha/index.db`. It is created auto
 -- One row per video file
 CREATE TABLE IF NOT EXISTS videos (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    path             TEXT UNIQUE NOT NULL,   -- absolute path
+    path             TEXT UNIQUE NOT NULL,   -- original absolute path (never changed)
     duration         REAL,                   -- seconds
-    fingerprinted_at REAL                    -- unix timestamp; NULL = not yet done
+    fingerprinted_at REAL,                   -- unix timestamp; NULL = not yet done
+    moved_to         TEXT                    -- destination path after move; NULL = not moved
 );
 
 -- One row per sampled frame

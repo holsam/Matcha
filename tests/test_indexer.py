@@ -57,6 +57,73 @@ class TestFingerprinting:
         for row in conn.execute("SELECT duration FROM videos").fetchall():
             assert row["duration"] is not None and row["duration"] > 0
 
+    def test_all_videos_fingerprinted_hwaccel(self, indexed_dir_hwaccel):
+        db_path = str(indexed_dir_hwaccel["dir"] / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        unprocessed = conn.execute(
+            "SELECT COUNT(*) FROM videos WHERE fingerprinted_at IS NULL"
+        ).fetchone()[0]
+        assert unprocessed == 0
+
+    def test_frame_hashes_created_hwaccel(self, indexed_dir_hwaccel):
+        db_path = str(indexed_dir_hwaccel["dir"] / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM frame_hashes").fetchone()[0]
+        assert count > 0
+
+    def test_frame_hash_count_matches_duration_hwaccel(self, indexed_dir_hwaccel):
+        """At 1fps, each video should have ~duration-in-seconds frames (±1)."""
+        db_path = str(indexed_dir_hwaccel["dir"] / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        rows = conn.execute(
+            """
+            SELECT v.duration, COUNT(f.id) as hash_count
+            FROM videos v JOIN frame_hashes f ON f.video_id = v.id
+            GROUP BY v.id
+            """
+        ).fetchall()
+        for row in rows:
+            assert abs(row["hash_count"] - int(row["duration"])) <= 1
+
+    def test_durations_stored_hwaccel(self, indexed_dir_hwaccel):
+        db_path = str(indexed_dir_hwaccel["dir"] / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        for row in conn.execute("SELECT duration FROM videos").fetchall():
+            assert row["duration"] is not None and row["duration"] > 0
+    
+    def test_all_videos_fingerprinted_noaudio(self, indexed_dir_no_audio):
+        db_path = str(indexed_dir_no_audio["dir"] / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        unprocessed = conn.execute(
+            "SELECT COUNT(*) FROM videos WHERE fingerprinted_at IS NULL"
+        ).fetchone()[0]
+        assert unprocessed == 0
+
+    def test_frame_hashes_created_noaudio(self, indexed_dir_no_audio):
+        db_path = str(indexed_dir_no_audio["dir"] / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM frame_hashes").fetchone()[0]
+        assert count > 0
+
+    def test_frame_hash_count_matches_duration_noaudio(self, indexed_dir_no_audio):
+        """At 1fps, each video should have ~duration-in-seconds frames (±1)."""
+        db_path = str(indexed_dir_no_audio["dir"] / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        rows = conn.execute(
+            """
+            SELECT v.duration, COUNT(f.id) as hash_count
+            FROM videos v JOIN frame_hashes f ON f.video_id = v.id
+            GROUP BY v.id
+            """
+        ).fetchall()
+        for row in rows:
+            assert abs(row["hash_count"] - int(row["duration"])) <= 1
+
+    def test_durations_stored_noaudio(self, indexed_dir_no_audio):
+        db_path = str(indexed_dir_no_audio["dir"] / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        for row in conn.execute("SELECT duration FROM videos").fetchall():
+            assert row["duration"] is not None and row["duration"] > 0
 
 class TestCheckpointing:
     def test_idempotent(self, indexed_dir):

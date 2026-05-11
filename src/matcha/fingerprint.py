@@ -5,23 +5,36 @@ from PIL import Image
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}
 
 
-def extract_frame_hashes(video_path: str, fps: float = 1.0) -> list[tuple[float, str]]:
+def extract_frame_hashes(
+    video_path: str,
+    fps: float = 1.0,
+    hwaccel: bool = False,
+) -> list[tuple[float, str]]:
     """
     Extract frames from a video at `fps` frames per second.
     Returns a list of (timestamp_seconds, phash_hex) tuples.
 
     Frames are written to a temporary directory and deleted immediately
     after hashing, keeping peak memory to roughly one frame at a time.
+
+    If hwaccel=True, passes -hwaccel auto to ffmpeg (on Mac this uses
+    VideoToolbox). Falls back silently to software decoding if unavailable.
+
+    The scale filter (160:120) reduces decode work for high-resolution
+    videos — pHash only needs a small image, so full-resolution frames
+    are unnecessary.
     """
     hashes = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         frame_pattern = os.path.join(tmpdir, "frame_%07d.png")
+        cmd = ["ffmpeg"]
 
-        cmd = [
-            "ffmpeg",
+        if hwaccel:
+            cmd += ["-hwaccel", "auto"]
+        cmd += [
             "-i", video_path,
-            "-vf", f"fps={fps}",
+            "-vf", f"fps={fps},scale=160:120",
             "-vsync", "vfr",
             "-f", "image2",
             frame_pattern,
@@ -40,7 +53,7 @@ def extract_frame_hashes(video_path: str, fps: float = 1.0) -> list[tuple[float,
             img = Image.open(frame_path).convert("L")  # greyscale — faster and sufficient for pHash
             phash = str(imagehash.phash(img))
             hashes.append((timestamp, phash))
-            frame_path.unlink()  # delete immediately after hashing
+            frame_path.unlink()
 
     return hashes
 

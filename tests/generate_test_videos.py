@@ -64,9 +64,9 @@ def random_duration():
 
 @app.command()
 def generate(
-    count: int = typer.Option(10),
-    exact_matches: int = typer.Option(0),
-    partial_matches: int = typer.Option(0),
+    count: int = typer.Option(30),
+    exact_matches: int = typer.Option(1),
+    partial_matches: int = typer.Option(1),
     seed: int = typer.Option(42),
     workers: int = typer.Option(4, help="Number of parallel workers"),
 ):
