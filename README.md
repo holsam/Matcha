@@ -20,14 +20,19 @@ Matcha is a CLI tool for finding duplicate and near-duplicate videos in a direct
 
 Matcha provides several subcommands:
 ```sh
-matcha index   <directory>   Fingerprint all videos and populate the index
-matcha match   <directory>   Compare indexed videos and record matches
-matcha move    <directory>   Move matched videos into duplicates/ subdirectories
-matcha cleanup <directory>   Remove deleted files from index and return kept files to original location
-matcha sync    <directory>   Remove index entries for files missing from disk
+matcha index    <directory>            Fingerprint all videos and populate the index
+matcha match    <directory>            Compare indexed videos and record matches
+matcha move     <directory>            Move matched videos into duplicates/ subdirectories
+matcha continue [directory] [command]  Re-run the last index or match command with the same configuration
+matcha cleanup  <directory>            Remove deleted files from index and return kept files to original location
+matcha sync     <directory>            Remove index entries for files missing from disk
 ```
 
-All subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. `match`, `move`, and `sync` all support --dry-run to preview changes before committing them. For more information on using the subcommands, see the relevant section of [Subcommand Usage](#subcommand-usage).
+`match`, `move`, and `sync` all support --dry-run to preview changes before committing them. 
+
+All subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. However `continue` is provided as a utility to continue the last `index` and `match` commands, and will continue using the same parameters as previously used. 
+
+For more information on using the subcommands, see the relevant section of [Subcommand Usage](#subcommand-usage).
 
 ## Installation
 ### Dependencies
@@ -160,6 +165,37 @@ uv run matcha move /path/to/Videos
 Numbering continues from where it left off — if duplicates/1/ and duplicates/2/ already exist, the next run starts at duplicates/3/.
 
 `matcha move` uses union-find as matches are stored as pairs, but groups can be larger. Union-find computes the transitive closure efficiently: it processes each pair in O(α(n)) time (effectively constant), so even a large match table resolves instantly.
+
+
+### `matcha continue`
+#### CLI options and usage
+| Option | Default | Description |
+|--------|---------|-------------|
+| `directory` | `.` | Directory to continue from |
+| `command` | (prompted) | Command to continue: `index` or `match` |
+
+```sh
+# Re-run the last command (prompts if both index and match configs exist)
+uv run matcha continue /path/to/Videos
+
+# Re-run specifically the last index
+uv run matcha continue /path/to/Videos index
+
+# Re-run specifically the last match
+uv run matcha continue /path/to/Videos match
+
+# Use the current directory (default)
+uv run matcha continue
+```
+
+#### Explanation
+`matcha continue` re-runs the last `index` or `match` command using the configuration that was saved automatically when that command was last run. This means you never have to remember which flags you used.
+
+Each run of `matcha index` or `matcha match` saves its arguments to `.matcha/index.json` or `.matcha/match.json`. `matcha continue` reads the relevant file and dispatches with the same arguments. If only one config file exists, `continue` runs that command immediately. If both exist, it lists them and prompts for a choice.
+
+When continuing a `match` run, `continue` checks whether any videos have been fingerprinted since the match config was last saved. If so, the FAISS index is invalidated and rebuilt on the next match run to incorporate the new entries — this prevents stale candidates from being silently missed.
+
+`continue` exits with an error if no database is found (i.e. `matcha index` has never been run) or if no saved config exists for the requested command.
 
 
 ## `matcha cleanup`
