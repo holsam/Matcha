@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from matcha.config import save_run_config
 from matcha.db import get_connection
-from matcha.faiss_index import build_index, find_candidate_pairs
+from matcha.faiss_index import update_index, find_candidate_pairs
 
 @dataclass
 class VideoRecord:
@@ -260,8 +260,8 @@ def run_match(
     # Pass 1
     _print_message('2', 'Starting Pass 1 (candidate generation)...')
     _print_message('2.1', 'Checking FAISS index state...')
-    rebuilt = build_index(db_path, index_dir, nprobe)
-    if not rebuilt:
+    changed = update_index(db_path, index_dir, nprobe)
+    if not changed:
         _print_message('2.1', 'FAISS index up to date.')
     conn = get_connection(db_path)
     existing_candidates: set[tuple[int, int]] = {
