@@ -7,9 +7,12 @@ File | What it covers
 `test_matcher.py` | Exact match detection, subclip detection, false-positive rejection, match checkpointing, `--filter-length` behaviour
 `test_mover.py` | Dry-run output, file movement, group directory assignment, DB path updates, `moved` flag, sequential numbering
 `test_continuer.py` | Config saving and loading, atomic writes, staleness detection, FAISS invalidation, `run_continue` dispatch, prompting behaviour
+`test_faiss.py` | Incremental build, idempotent no-op, append on new videos, in-place vector removal and tombstoning, no ID collision after remove + append
+`test_cleanup.py` | Duplicates reconciliation, lone-survivor return, global missing-file purge (formerly `sync`), dry-run, FAISS vector removal
 
 ## Running tests
-Test videos should be generated before the session using `generate_test_videos.py` then reused across all tests.
+`test_indexer.py`, `test_matcher.py`, `test_mover.py` and `test_continuer.py` require test videos which sould be generated before the session using `generate_test_videos.py` then reused across all tests. `test_faiss.py` and `test_cleanup.py` use small synthetic databases and dummy files rather than the generated videos, so they run quickly and in isolation.
+
 ```bash
 # Generate test videos
 cd tests
