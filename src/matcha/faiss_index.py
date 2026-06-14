@@ -13,6 +13,10 @@ _DEFAULT_NLIST = 100
 # How many IVF cells to probe at query time (higher = more accurate but slower).
 DEFAULT_NPROBE = 32
 
+# Rebuild guard variables. A full rebuild is worthwhile when the trained IVF cell count has fallen well behind the ideal for the current size, or when tombstones from removals have built up. Both slow queries down; a rebuild restores the ideal shape and compacts the ID map.
+_REBUILD_NLIST_GROWTH = 2.0
+_REBUILD_TOMBSTONE_FRACTION = 0.25
+
 def _print_message(stage: str, msg: str):
     ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
     tab = stage.count('.') + 1
@@ -267,3 +271,43 @@ def remove_videos_from_index(index_dir: str, video_ids) -> int:
     np.save(map_path, id_map)
     set_faiss_meta(os.path.join(index_dir, "index.db"), int(index.ntotal))
     return int(n_removed)
+
+def rebuild_recommended(index, id_map) -> tuple[bool, str]:
+    """Return (should_rebuild, human_reason) for the given index and ID map."""
+    live = int(index.ntotal)
+    total_rows = int(id_map.shape[0]) if id_map.size else 0
+    if total_rows == 0 or live == 0:
+        return False, ""
+
+    trained_nlist = int(index.nlist)
+    ideal_nlist = max(1, min(_DEFAULT_NLIST, int(live ** 0.5)))
+    if ideal_nlist > trained_nlist and ideal_nlist >= _REBUILD_NLIST_GROWTH * trained_nlist:
+        return True, f"IVF cells {trained_nlist} -> {ideal_nlist} for {live:,} live vectors"
+
+    tombstone_fraction = (total_rows - live) / total_rows
+    if tombstone_fraction >= _REBUILD_TOMBSTONE_FRACTION:
+        return True, f"{tombstone_fraction:.0%} of the index is tombstoned"
+
+    return False, ""
+
+def maybe_rebuild_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
+    """
+    Rebuild the index from scratch if it has drifted from its ideal shape.
+
+    A no-op in the common case; it only fires after a lot of growth or a lot of
+    removals. Reads the current frame hashes from the DB, so deleted videos
+    (whose rows are gone) drop out and their tombstones are compacted away.
+    Returns True if a rebuild happened.
+    """
+    faiss_path, map_path = _index_paths(index_dir)
+    if not os.path.exists(faiss_path) or not os.path.exists(map_path):
+        return False
+
+    index = faiss.read_index_binary(faiss_path)
+    id_map = np.load(map_path)
+    should, reason = rebuild_recommended(index, id_map)
+    if not should:
+        return False
+
+    print(f"Rebuilding FAISS index ({reason})...")
+    return _full_build(db_path, index_dir, nprobe)
