@@ -23,7 +23,6 @@ def _hex_to_bytes(hex_str: str) -> bytes:
     """Convert a 16-character hex pHash string to 8 packed bytes."""
     return bytes.fromhex(hex_str)
 
-
 def _load_all_hashes(db_path: str) -> tuple[np.ndarray, np.ndarray]:
     """
     Read every frame hash from the DB.
@@ -60,6 +59,8 @@ def _query_batch(args: tuple) -> set[tuple[int, int]]:
             if dist > threshold:
                 continue
             candidate_vid = int(id_map[lbl, 0])
+            if candidate_vid < 0:
+                continue  # tombstoned
             if candidate_vid == query_vid:
                 continue
             pair = (min(query_vid, candidate_vid), max(query_vid, candidate_vid))
@@ -123,7 +124,7 @@ def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> b
     index = faiss.IndexBinaryIVF(quantiser, d, nlist)
     index.nprobe = nprobe
     index.train(vectors)
-    index.add(vectors)
+    index.add_with_ids(vectors, np.arrange(n, dtype=np.int64))
 
     faiss_path, map_path = _index_paths(index_dir)
     faiss.write_index_binary(index, faiss_path)
@@ -152,14 +153,18 @@ def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> 
 
     index = faiss.read_index_binary(faiss_path)
     id_map = np.load(map_path)
-    known_vids = {int(v) for v in id_map[:, 0].tolist()} if id_map.size else set()
+    known_vids = (
+        {int(v) for v in id_map[:, 0].tolist() if int(v) >= 0} if id_map.size else set()
+    )
 
     new_vectors, new_id_map = _load_new_hashes(db_path, known_vids)
     if len(new_vectors) == 0:
         return False  # already up to date
 
     print(f"Appending {len(new_vectors):,} new frame hashes to the FAISS index...")
-    index.add(new_vectors)
+    start = int(id_map.shape[0]) if id_map.size else 0
+    ids = np.arange(start, start + len(new_vectors), dtype=np.int64)
+    index.add_with_ids(new_vectors, ids)
     id_map = np.vstack([id_map, new_id_map]) if id_map.size else new_id_map
 
     faiss.write_index_binary(index, faiss_path)
@@ -167,7 +172,6 @@ def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> 
     set_faiss_meta(db_path, len(id_map))
     print(f"FAISS index updated ({len(id_map):,} vectors total).")
     return True
-
 
 def load_index(index_dir: str) -> tuple[faiss.IndexBinaryIVF, np.ndarray]:
     """Load a previously built index and its ID map from disk."""
@@ -228,3 +232,38 @@ def find_candidate_pairs(
         ):
             candidate_pairs.update(batch_result)
     return candidate_pairs
+
+def remove_videos_from_index(index_dir: str, video_ids) -> int:
+    """
+    Remove every vector belonging to the given video_ids from the FAISS index, in place, and tombstone those rows in the ID map. Returns the number of vectors removed. No-op (returns 0) if there is no index yet.
+    """
+    faiss_path, map_path = _index_paths(index_dir)
+    if not os.path.exists(faiss_path) or not os.path.exists(map_path):
+        return 0
+
+    wanted = {int(v) for v in video_ids}
+    if not wanted:
+        return 0
+
+    index = faiss.read_index_binary(faiss_path)
+    id_map = np.load(map_path)
+    if id_map.size == 0:
+        return 0
+
+    mask = np.isin(id_map[:, 0], list(wanted)) & (id_map[:, 0] >= 0)
+    labels = np.where(mask)[0].astype(np.int64)
+    if labels.size == 0:
+        return 0
+
+    try:
+        selector = faiss.IDSelectorBatch(labels)
+    except TypeError:  # older faiss constructor signature
+        selector = faiss.IDSelectorBatch(len(labels), faiss.swig_ptr(labels))
+    n_removed = index.remove_ids(selector)
+
+    id_map[mask, 0] = -1  # tombstone; keeps positions aligned with FAISS IDs
+
+    faiss.write_index_binary(index, faiss_path)
+    np.save(map_path, id_map)
+    set_faiss_meta(os.path.join(index_dir, "index.db"), int(index.ntotal))
+    return int(n_removed)
