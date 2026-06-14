@@ -1,11 +1,10 @@
-import faiss, os, typer
+import faiss, os
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from tqdm import tqdm
-from threading import Lock
 
-from .db import get_connection, get_faiss_meta, set_faiss_meta
+from .db import get_connection, set_faiss_meta
 
 # Number of IVF cells. Rule of thumb: sqrt(N) where N is total vector count.
 # This is recalculated at build time; this is just a fallback default.
@@ -67,31 +66,106 @@ def _query_batch(args: tuple) -> set[tuple[int, int]]:
             pairs.add(pair)
     return pairs
 
-def build_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
+def _index_paths(index_dir: str) -> tuple[str, str]:
+    """Return (faiss_path, map_path) for a given index directory."""
+    return (
+        os.path.join(index_dir, "frame_index.faiss"),
+        os.path.join(index_dir, "frame_index_map.npy"),
+    )
+
+def _load_new_hashes(
+    db_path: str, known_video_ids: set[int]
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build (or rebuild) the FAISS index from all frame hashes currently in the DB.
+    Load frame hashes for videos that are not yet in the index.
+
+    Rows are read in the same (video_id, timestamp) order used everywhere
+    else, so the appended ID-map rows line up with the order FAISS assigns to
+    the new vectors.
     """
     conn = get_connection(db_path)
+    rows = conn.execute(
+        """
+        SELECT video_id, phash
+        FROM frame_hashes
+        ORDER BY video_id, timestamp
+        """
+    ).fetchall()
+    rows = [r for r in rows if r["video_id"] not in known_video_ids]
+    if not rows:
+        return np.empty((0, 8), dtype=np.uint8), np.empty((0, 2), dtype=np.int64)
+    vectors = np.array(
+        [list(_hex_to_bytes(r["phash"])) for r in rows], dtype=np.uint8
+    )
+    frame_counter: dict[int, int] = {}
+    id_map_rows = []
+    for r in rows:
+        vid = r["video_id"]
+        frame_counter[vid] = frame_counter.get(vid, 0)
+        id_map_rows.append([vid, frame_counter[vid]])
+        frame_counter[vid] += 1
+    id_map = np.array(id_map_rows, dtype=np.int64)
+    return vectors, id_map
+
+def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
+    """Train and build the index from scratch over all frame hashes."""
+    conn = get_connection(db_path)
     current_count = conn.execute("SELECT COUNT(*) FROM frame_hashes").fetchone()[0]
-    meta = get_faiss_meta(db_path)
-    if meta and meta["vector_count"] == current_count:
-        return False  # Nothing new — skip rebuild
+    if current_count == 0:
+        return False  # nothing to index yet
+
     print(f"Building FAISS index over {current_count:,} frame hashes...")
     vectors, id_map = _load_all_hashes(db_path)
     n = len(vectors)
     nlist = max(1, min(_DEFAULT_NLIST, int(n ** 0.5)))
-    d = 64  # 64-bit pHash → 64 binary dimensions
+    d = 64  # 64-bit pHash -> 64 binary dimensions
     quantiser = faiss.IndexBinaryFlat(d)
     index = faiss.IndexBinaryIVF(quantiser, d, nlist)
     index.nprobe = nprobe
     index.train(vectors)
     index.add(vectors)
-    faiss_path = os.path.join(index_dir, "frame_index.faiss")
-    map_path = os.path.join(index_dir, "frame_index_map.npy")
+
+    faiss_path, map_path = _index_paths(index_dir)
     faiss.write_index_binary(index, faiss_path)
     np.save(map_path, id_map)
-    set_faiss_meta(db_path, current_count)
+    set_faiss_meta(db_path, n)
     print(f"FAISS index saved ({n:,} vectors, {nlist} IVF cells).")
+    return True
+
+def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
+    """
+    Bring the FAISS index up to date with the database.
+
+    First run (no index on disk): trains and builds from all frame hashes.
+    Later runs: appends only the vectors for videos not already in the index,
+    with no retraining.
+
+    Videos deleted from the database are not removed here. Their vectors stay
+    in the index and are filtered out by the matcher, which skips any candidate
+    whose video_id no longer exists. Returns True if the index changed on disk.
+    """
+    faiss_path, map_path = _index_paths(index_dir)
+
+    # First run, or a forced rebuild (files were removed) -> full build.
+    if not os.path.exists(faiss_path) or not os.path.exists(map_path):
+        return _full_build(db_path, index_dir, nprobe)
+
+    index = faiss.read_index_binary(faiss_path)
+    id_map = np.load(map_path)
+    known_vids = {int(v) for v in id_map[:, 0].tolist()} if id_map.size else set()
+
+    new_vectors, new_id_map = _load_new_hashes(db_path, known_vids)
+    if len(new_vectors) == 0:
+        return False  # already up to date
+
+    print(f"Appending {len(new_vectors):,} new frame hashes to the FAISS index...")
+    index.add(new_vectors)
+    id_map = np.vstack([id_map, new_id_map]) if id_map.size else new_id_map
+
+    faiss.write_index_binary(index, faiss_path)
+    np.save(map_path, id_map)
+    set_faiss_meta(db_path, len(id_map))
+    print(f"FAISS index updated ({len(id_map):,} vectors total).")
     return True
 
 
