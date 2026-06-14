@@ -126,8 +126,7 @@ def run_continue(directory: str, command: str | None = None) -> None:
     # If continuing a match, check if the index is stale
     if command == 'match':
         if check_index_stale(matcha_dir, config):
-            typer.echo('Warning: the index has been updated since the last match run. "The FAISS index will be rebuilt before matching.')
-            invalidate_faiss_index(matcha_dir)
+            typer.echo(f'Note: videos have been indexed since the last match run. They will be added to the FAISS index incrementally.')
     # Dispatch to the appropriate command
     if command == 'index':
         run_index(directory, **args)

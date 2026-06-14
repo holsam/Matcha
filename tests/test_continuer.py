@@ -457,13 +457,12 @@ class TestRunContinue:
             assert call_args[1].get("window") == 20.0
             assert call_args[1].get("frame_step") == 5
 
-    def test_stale_index_triggers_faiss_rebuild(self, tmp_path):
-        """Should invalidate FAISS index if videos added since last match."""
+    def test_stale_index_not_invalidated(self, tmp_path):
+        """Continue match must NOT delete the index; update_index appends incrementally."""
         db_path = os.path.join(tmp_path, "index.db")
         matcha_dir = os.path.join(tmp_path, ".matcha")
         Path(matcha_dir).mkdir(parents=True, exist_ok=True)
 
-        # Create DB and add a video
         import sqlite3
 
         conn = sqlite3.connect(db_path)
@@ -486,17 +485,14 @@ class TestRunContinue:
             )
             """
         )
-        # Video fingerprinted recently (after the match config's last_run)
         recent_time = datetime.now(timezone.utc).isoformat()
         cursor.execute(
             "INSERT INTO videos (path, duration, fingerprinted_at) VALUES (?, ?, ?)",
             ("test.mp4", 100.0, recent_time),
         )
-        cursor.execute("INSERT INTO faiss_index_meta (built_at) VALUES (?)", ("2025-01-01",))
         conn.commit()
         conn.close()
 
-        # Match config with a last_run from 1 hour ago
         past_time = (
             (datetime.now(timezone.utc) - timedelta(hours=1))
             .isoformat()
@@ -515,8 +511,6 @@ class TestRunContinue:
                 "nprobe": 32,
             },
         )
-
-        # Manually update last_run to be in the past
         config_path = os.path.join(matcha_dir, "match.json")
         with open(config_path, "r") as f:
             config = json.load(f)
@@ -524,19 +518,18 @@ class TestRunContinue:
         with open(config_path, "w") as f:
             json.dump(config, f)
 
-        # Create dummy FAISS files
         faiss_file = os.path.join(matcha_dir, "frame_index.faiss")
         faiss_map = os.path.join(matcha_dir, "frame_index_map.npy")
         Path(faiss_file).touch()
         Path(faiss_map).touch()
 
-        # Mock run_match
-        with patch("matcha.continuer.run_match"):
+        with patch("matcha.continuer.run_match") as mock_run_match:
             run_continue(str(tmp_path), "match")
 
-        # FAISS files should be deleted
-        assert not os.path.exists(faiss_file)
-        assert not os.path.exists(faiss_map)
+        mock_run_match.assert_called_once()
+        # The index is left in place; the incremental update will append.
+        assert os.path.exists(faiss_file)
+        assert os.path.exists(faiss_map)
 
     def test_prompts_when_both_configs_present(self, tmp_path):
         """Should prompt user when both index and match configs exist."""

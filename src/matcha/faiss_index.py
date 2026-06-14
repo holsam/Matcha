@@ -1,11 +1,10 @@
-import faiss, os, typer
+import faiss, os
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from tqdm import tqdm
-from threading import Lock
 
-from .db import get_connection, get_faiss_meta, set_faiss_meta
+from .db import get_connection, set_faiss_meta
 
 # Number of IVF cells. Rule of thumb: sqrt(N) where N is total vector count.
 # This is recalculated at build time; this is just a fallback default.
@@ -13,6 +12,10 @@ _DEFAULT_NLIST = 100
 
 # How many IVF cells to probe at query time (higher = more accurate but slower).
 DEFAULT_NPROBE = 32
+
+# Rebuild guard variables. A full rebuild is worthwhile when the trained IVF cell count has fallen well behind the ideal for the current size, or when tombstones from removals have built up. Both slow queries down; a rebuild restores the ideal shape and compacts the ID map.
+_REBUILD_NLIST_GROWTH = 2.0
+_REBUILD_TOMBSTONE_FRACTION = 0.25
 
 def _print_message(stage: str, msg: str):
     ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
@@ -23,7 +26,6 @@ def _print_message(stage: str, msg: str):
 def _hex_to_bytes(hex_str: str) -> bytes:
     """Convert a 16-character hex pHash string to 8 packed bytes."""
     return bytes.fromhex(hex_str)
-
 
 def _load_all_hashes(db_path: str) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -61,39 +63,119 @@ def _query_batch(args: tuple) -> set[tuple[int, int]]:
             if dist > threshold:
                 continue
             candidate_vid = int(id_map[lbl, 0])
+            if candidate_vid < 0:
+                continue  # tombstoned
             if candidate_vid == query_vid:
                 continue
             pair = (min(query_vid, candidate_vid), max(query_vid, candidate_vid))
             pairs.add(pair)
     return pairs
 
-def build_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
+def _index_paths(index_dir: str) -> tuple[str, str]:
+    """Return (faiss_path, map_path) for a given index directory."""
+    return (
+        os.path.join(index_dir, "frame_index.faiss"),
+        os.path.join(index_dir, "frame_index_map.npy"),
+    )
+
+def _load_new_hashes(
+    db_path: str, known_video_ids: set[int]
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build (or rebuild) the FAISS index from all frame hashes currently in the DB.
+    Load frame hashes for videos that are not yet in the index.
+
+    Rows are read in the same (video_id, timestamp) order used everywhere
+    else, so the appended ID-map rows line up with the order FAISS assigns to
+    the new vectors.
     """
     conn = get_connection(db_path)
+    rows = conn.execute(
+        """
+        SELECT video_id, phash
+        FROM frame_hashes
+        ORDER BY video_id, timestamp
+        """
+    ).fetchall()
+    rows = [r for r in rows if r["video_id"] not in known_video_ids]
+    if not rows:
+        return np.empty((0, 8), dtype=np.uint8), np.empty((0, 2), dtype=np.int64)
+    vectors = np.array(
+        [list(_hex_to_bytes(r["phash"])) for r in rows], dtype=np.uint8
+    )
+    frame_counter: dict[int, int] = {}
+    id_map_rows = []
+    for r in rows:
+        vid = r["video_id"]
+        frame_counter[vid] = frame_counter.get(vid, 0)
+        id_map_rows.append([vid, frame_counter[vid]])
+        frame_counter[vid] += 1
+    id_map = np.array(id_map_rows, dtype=np.int64)
+    return vectors, id_map
+
+def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
+    """Train and build the index from scratch over all frame hashes."""
+    conn = get_connection(db_path)
     current_count = conn.execute("SELECT COUNT(*) FROM frame_hashes").fetchone()[0]
-    meta = get_faiss_meta(db_path)
-    if meta and meta["vector_count"] == current_count:
-        return False  # Nothing new — skip rebuild
+    if current_count == 0:
+        return False  # nothing to index yet
+
     print(f"Building FAISS index over {current_count:,} frame hashes...")
     vectors, id_map = _load_all_hashes(db_path)
     n = len(vectors)
     nlist = max(1, min(_DEFAULT_NLIST, int(n ** 0.5)))
-    d = 64  # 64-bit pHash → 64 binary dimensions
+    d = 64  # 64-bit pHash -> 64 binary dimensions
     quantiser = faiss.IndexBinaryFlat(d)
     index = faiss.IndexBinaryIVF(quantiser, d, nlist)
     index.nprobe = nprobe
     index.train(vectors)
-    index.add(vectors)
-    faiss_path = os.path.join(index_dir, "frame_index.faiss")
-    map_path = os.path.join(index_dir, "frame_index_map.npy")
+    index.add_with_ids(vectors, np.arange(n, dtype=np.int64))
+
+    faiss_path, map_path = _index_paths(index_dir)
     faiss.write_index_binary(index, faiss_path)
     np.save(map_path, id_map)
-    set_faiss_meta(db_path, current_count)
+    set_faiss_meta(db_path, n)
     print(f"FAISS index saved ({n:,} vectors, {nlist} IVF cells).")
     return True
 
+def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
+    """
+    Bring the FAISS index up to date with the database.
+
+    First run (no index on disk): trains and builds from all frame hashes.
+    Later runs: appends only the vectors for videos not already in the index,
+    with no retraining.
+
+    Videos deleted from the database are not removed here. Their vectors stay
+    in the index and are filtered out by the matcher, which skips any candidate
+    whose video_id no longer exists. Returns True if the index changed on disk.
+    """
+    faiss_path, map_path = _index_paths(index_dir)
+
+    # First run, or a forced rebuild (files were removed) -> full build.
+    if not os.path.exists(faiss_path) or not os.path.exists(map_path):
+        return _full_build(db_path, index_dir, nprobe)
+
+    index = faiss.read_index_binary(faiss_path)
+    id_map = np.load(map_path)
+    known_vids = (
+        {int(v) for v in id_map[:, 0].tolist() if int(v) >= 0} if id_map.size else set()
+    )
+
+    new_vectors, new_id_map = _load_new_hashes(db_path, known_vids)
+    if len(new_vectors) == 0:
+        return False  # already up to date
+
+    print(f"Appending {len(new_vectors):,} new frame hashes to the FAISS index...")
+    start = int(id_map.shape[0]) if id_map.size else 0
+    ids = np.arange(start, start + len(new_vectors), dtype=np.int64)
+    index.add_with_ids(new_vectors, ids)
+    id_map = np.vstack([id_map, new_id_map]) if id_map.size else new_id_map
+
+    faiss.write_index_binary(index, faiss_path)
+    np.save(map_path, id_map)
+    set_faiss_meta(db_path, len(id_map))
+    print(f"FAISS index updated ({len(id_map):,} vectors total).")
+    return True
 
 def load_index(index_dir: str) -> tuple[faiss.IndexBinaryIVF, np.ndarray]:
     """Load a previously built index and its ID map from disk."""
@@ -154,3 +236,78 @@ def find_candidate_pairs(
         ):
             candidate_pairs.update(batch_result)
     return candidate_pairs
+
+def remove_videos_from_index(index_dir: str, video_ids) -> int:
+    """
+    Remove every vector belonging to the given video_ids from the FAISS index, in place, and tombstone those rows in the ID map. Returns the number of vectors removed. No-op (returns 0) if there is no index yet.
+    """
+    faiss_path, map_path = _index_paths(index_dir)
+    if not os.path.exists(faiss_path) or not os.path.exists(map_path):
+        return 0
+
+    wanted = {int(v) for v in video_ids}
+    if not wanted:
+        return 0
+
+    index = faiss.read_index_binary(faiss_path)
+    id_map = np.load(map_path)
+    if id_map.size == 0:
+        return 0
+
+    mask = np.isin(id_map[:, 0], list(wanted)) & (id_map[:, 0] >= 0)
+    labels = np.where(mask)[0].astype(np.int64)
+    if labels.size == 0:
+        return 0
+
+    try:
+        selector = faiss.IDSelectorBatch(labels)
+    except TypeError:  # older faiss constructor signature
+        selector = faiss.IDSelectorBatch(len(labels), faiss.swig_ptr(labels))
+    n_removed = index.remove_ids(selector)
+
+    id_map[mask, 0] = -1  # tombstone; keeps positions aligned with FAISS IDs
+
+    faiss.write_index_binary(index, faiss_path)
+    np.save(map_path, id_map)
+    set_faiss_meta(os.path.join(index_dir, "index.db"), int(index.ntotal))
+    return int(n_removed)
+
+def rebuild_recommended(index, id_map) -> tuple[bool, str]:
+    """Return (should_rebuild, human_reason) for the given index and ID map."""
+    live = int(index.ntotal)
+    total_rows = int(id_map.shape[0]) if id_map.size else 0
+    if total_rows == 0 or live == 0:
+        return False, ""
+
+    trained_nlist = int(index.nlist)
+    ideal_nlist = max(1, min(_DEFAULT_NLIST, int(live ** 0.5)))
+    if ideal_nlist > trained_nlist and ideal_nlist >= _REBUILD_NLIST_GROWTH * trained_nlist:
+        return True, f"IVF cells {trained_nlist} -> {ideal_nlist} for {live:,} live vectors"
+
+    tombstone_fraction = (total_rows - live) / total_rows
+    if tombstone_fraction >= _REBUILD_TOMBSTONE_FRACTION:
+        return True, f"{tombstone_fraction:.0%} of the index is tombstoned"
+
+    return False, ""
+
+def maybe_rebuild_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
+    """
+    Rebuild the index from scratch if it has drifted from its ideal shape.
+
+    A no-op in the common case; it only fires after a lot of growth or a lot of
+    removals. Reads the current frame hashes from the DB, so deleted videos
+    (whose rows are gone) drop out and their tombstones are compacted away.
+    Returns True if a rebuild happened.
+    """
+    faiss_path, map_path = _index_paths(index_dir)
+    if not os.path.exists(faiss_path) or not os.path.exists(map_path):
+        return False
+
+    index = faiss.read_index_binary(faiss_path)
+    id_map = np.load(map_path)
+    should, reason = rebuild_recommended(index, id_map)
+    if not should:
+        return False
+
+    print(f"Rebuilding FAISS index ({reason})...")
+    return _full_build(db_path, index_dir, nprobe)
