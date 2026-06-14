@@ -5,7 +5,6 @@ from matcha.continuer import run_continue
 from matcha.indexer import run_index
 from matcha.matcher import run_match
 from matcha.mover import run_move
-from matcha.sync import run_sync
 
 app = typer.Typer(help="Matcha — a video matching tool using perceptual hashing.")
 
@@ -57,14 +56,17 @@ def move(
 @app.command()
 def cleanup(
     directory: str = typer.Argument(..., help="Directory to clean up."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without changing the index, database, or files."),
 ):
     """
-    Check duplicates/ for files deleted by the user since moving.
+    Reconcile the index with what is on disk.
 
-    Removes deleted files from the index. If only one file remains in a
-    subdirectory, returns it to its original location.
+    Removes index entries for any file that no longer exists, including those
+    deleted from duplicates/. When a single file survives a duplicates group it
+    is returned to its original location. Matching vectors are removed from the
+    FAISS index in place.
     """
-    run_cleanup(directory)
+    run_cleanup(directory, dry_run=dry_run)
 
 
 @app.command()
@@ -76,15 +78,6 @@ def continue_(
     Re-run the last index or match command using the same configuration.
     """
     run_continue(directory, command)
-
-
-@app.command()
-def sync(
-    directory: str = typer.Argument(..., help="Directory to sync."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without modifying the index."),
-):
-    """Remove index entries for files that no longer exist on disk."""
-    run_sync(directory, dry_run=dry_run)
 
 if __name__ == "__main__":
     app()
