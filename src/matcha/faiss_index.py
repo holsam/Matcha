@@ -124,7 +124,7 @@ def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> b
     index = faiss.IndexBinaryIVF(quantiser, d, nlist)
     index.nprobe = nprobe
     index.train(vectors)
-    index.add_with_ids(vectors, np.arrange(n, dtype=np.int64))
+    index.add_with_ids(vectors, np.arange(n, dtype=np.int64))
 
     faiss_path, map_path = _index_paths(index_dir)
     faiss.write_index_binary(index, faiss_path)
