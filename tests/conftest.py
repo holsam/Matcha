@@ -26,9 +26,10 @@ def video_dir():
     # Load manifest
     import csv
 
-    exact_pair = []
-    partial_pair = []
+    exact_pairs = []
+    partial_pairs = []
     all_videos = []
+    paired = set()
 
     with open(manifest) as f:
         reader = csv.DictReader(f)
@@ -40,27 +41,27 @@ def video_dir():
             all_videos.extend([a, b])
 
             if rel == "exact":
-                exact_pair.extend([a, b])
+                exact_pairs.append((a, b))
+                paired.update([a, b])
             elif rel == "partial":
-                partial_pair.extend([a, b])
+                partial_pairs.append((a, b))
+                paired.update([a, b])
 
     # Deduplicate
     all_videos = list(set(all_videos))
 
-    # Pick independent videos (not in any relationship)
-    paired = set()
-    if exact_pair:
-        paired.update(exact_pair)
-    if partial_pair:
-        paired.update(partial_pair)
-
+    # Independent videos belong to no relationship at all
     independent = [v for v in all_videos if v not in paired][:3]
 
     return {
         "dir": d,
         "independent": independent,
-        "exact_pair": exact_pair,
-        "partial_pair": partial_pair,
+        # First pair of each kind, as a 2-element list so tests can unpack it
+        "exact_pair": list(exact_pairs[0]) if exact_pairs else [],
+        "partial_pair": list(partial_pairs[0]) if partial_pairs else [],
+        # All pairs, for any test that wants to iterate
+        "exact_pairs": exact_pairs,
+        "partial_pairs": partial_pairs,
     }
 
 
