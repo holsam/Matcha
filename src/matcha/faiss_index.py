@@ -72,7 +72,11 @@ def _load_all_hashes(db_path: str) -> tuple[np.ndarray, np.ndarray]:
 def _query_batch(args: tuple) -> tuple[set[tuple[int, int]], set[int]]:
     """Process a single batch of queries. Returns (candidate pairs, video_ids covered) for this batch."""
     batch, batch_vids, index, id_map, k, threshold = args
-    distances, labels = index.search(batch, k)
+    # identical hashes return identical neighbours (static scenes, black frames), so search each distinct hash once
+    keys = np.ascontiguousarray(batch).view(np.uint64).ravel()
+    _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+    distances, labels = index.search(batch[first], k)
+    distances, labels = distances[inverse], labels[inverse]
     valid = (labels >= 0) & (distances <= threshold)
     query_vids = np.broadcast_to(batch_vids[:, None], labels.shape)[valid]
     candidate_vids = id_map[labels[valid], 0]
