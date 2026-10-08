@@ -389,6 +389,7 @@ dependencies = [
     { name = "imagehash" },
     { name = "pillow" },
     { name = "pyacoustid" },
+    { name = "tqdm" },
     { name = "typer" },
 ]
 
@@ -397,7 +398,6 @@ dev = [
     { name = "matplotlib" },
     { name = "opencv-python" },
     { name = "pytest" },
-    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -406,6 +406,7 @@ requires-dist = [
     { name = "imagehash", specifier = ">=4.3.2" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pyacoustid", specifier = ">=1.3.1" },
+    { name = "tqdm", specifier = ">=4.67.3" },
     { name = "typer", specifier = ">=0.24.1" },
 ]
 
@@ -414,7 +415,6 @@ dev = [
     { name = "matplotlib", specifier = ">=3.11.2" },
     { name = "opencv-python", specifier = ">=4.13.0.92" },
     { name = "pytest", specifier = ">=9.0.3" },
-    { name = "tqdm", specifier = ">=4.67.3" },
 ]
 
 [[package]]
