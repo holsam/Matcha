@@ -230,7 +230,7 @@ def _step_names(results: list[dict]) -> list[str]:
             seen.update(dict.fromkeys(run['steps']))
     return list(seen)
 
-# _plot: overlay one or more result files per command (label = linestyle), save PNGs
+# _plot: one figure per command; colour = label only, steps are separate panels
 def _plot(args: argparse.Namespace) -> None:
     import matplotlib
     matplotlib.use('Agg')
@@ -239,53 +239,81 @@ def _plot(args: argparse.Namespace) -> None:
     results = _load(sorted(_OUT_DIR.glob('*.json')))
     if not results:
         sys.exit(f'no result files in {_OUT_DIR}, run the benchmark first')
-    styles = ['-', '--', ':', '-.']
     out_dir = _OUT_DIR / 'plots'
     out_dir.mkdir(parents=True, exist_ok=True)
+    labels = list(dict.fromkeys(r['label'] for r in results))
+    colour = {label: f'C{i}' for i, label in enumerate(labels)}
+
     for command in sorted({r['command'] for r in results}):
         group = [r for r in results if r['command'] == command]
         steps = _step_names(group)
-        colours = {s: f'C{i}' for i, s in enumerate(steps)}
-        unit = 's' if command == 'match' else 's per video'
+        unit = 'seconds' if command == 'match' else 'seconds per video'
         all_runs = [run for r in group for run in r['runs']]
         max_videos = max(run['videos'] for run in all_runs)
         max_workers = max(run['workers'] for run in all_runs)
+        ncols = max(3, len(steps))
 
-        fig, axes = plt.subplots(1, 3, figsize=(17, 5))
-        # (1) step time against video count at the highest worker count
-        # (2) step time against worker count at the highest video count
-        # (3) total against workers, one line per video count, with ideal scaling
-        for gi, res in enumerate(group):
-            ls = styles[gi % len(styles)]
+        fig = plt.figure(figsize=(3.4 * ncols, 11), constrained_layout=True)
+        grid = fig.add_gridspec(3, ncols)
+
+        # summary row: where the time goes, then total against videos and workers
+        ax = fig.add_subplot(grid[0, 0])
+        # viridis for steps so they never share a colour with a run label
+        step_cols = {s: plt.cm.viridis(i / max(1, len(steps) - 1)) for i, s in enumerate(steps)}
+        bars = [(res['label'], run) for res in group for run in res['runs']
+                if run['videos'] == max_videos and run['workers'] == max_workers]  # labels run at the largest config
+        for yi, (_, run) in enumerate(bars):
+            left = 0.0
             for step in steps:
-                for ax, x_key, fixed_key, fixed in ((axes[0], 'videos', 'workers', max_workers),
-                                                    (axes[1], 'workers', 'videos', max_videos)):
-                    pts = sorted((run[x_key], run['steps'][step]) for run in res['runs']
-                                 if run[fixed_key] == fixed and step in run['steps'])
+                width = run['steps'].get(step, 0.0)
+                ax.barh(yi, width, left=left, color=step_cols[step], label=step if yi == 0 else None)
+                left += width
+        ax.set_yticks(range(len(bars)), [label for label, _ in bars])
+        ax.set(title=f'where time goes ({max_videos:,} videos, {max_workers} workers)', xlabel='seconds')
+        if bars:
+            ax.legend(fontsize=11, loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2)  # below the bars so it hides nothing
+
+        ax = fig.add_subplot(grid[0, 1])
+        for res in group:
+            pts = sorted((r['videos'], r['total']) for r in res['runs'] if r['workers'] == max_workers)
+            ax.plot(*zip(*pts), marker='o', color=colour[res['label']], label=res['label'])
+        ax.set(title=f'total vs videos ({max_workers} workers)', xlabel='videos', ylabel='wall seconds')
+        ax.legend(fontsize=11)
+
+        ax = fig.add_subplot(grid[0, 2])
+        for res in group:
+            pts = sorted((r['workers'], r['total']) for r in res['runs'] if r['videos'] == max_videos)
+            ax.plot(*zip(*pts), marker='o', color=colour[res['label']], label=res['label'])
+        first = next((sorted((r['workers'], r['total']) for r in res['runs'] if r['videos'] == max_videos)
+                      for res in group if any(r['videos'] == max_videos for r in res['runs'])), [])
+        ax.plot([p[0] for p in first], [first[0][1] * first[0][0] / p[0] for p in first],
+                color='grey', ls=':', label='ideal')
+        ax.set(title=f'total vs workers ({max_videos:,} videos)', xlabel='workers', ylabel='wall seconds')
+        ax.legend(fontsize=11)
+
+        # one small panel per step: row 1 against videos, row 2 against workers
+        for ci, step in enumerate(steps):
+            for row, x_key, fixed_key, fixed in ((1, 'videos', 'workers', max_workers),
+                                                 (2, 'workers', 'videos', max_videos)):
+                ax = fig.add_subplot(grid[row, ci])
+                for res in group:
+                    pts = sorted((r[x_key], r['steps'][step]) for r in res['runs']
+                                 if r[fixed_key] == fixed and step in r['steps'])
                     if pts:
-                        ax.plot(*zip(*pts), ls, marker='o', color=colours[step],
-                                label=f'{step} ({res["label"]})')
-            for vi, n in enumerate(sorted({run['videos'] for run in res['runs']})):
-                pts = sorted((run['workers'], run['total']) for run in res['runs'] if run['videos'] == n)
-                axes[2].plot(*zip(*pts), ls, marker='o', color=f'C{vi}', label=f'{n:,} videos ({res["label"]})')
-                if gi == 0:
-                    w0, t0 = pts[0]
-                    axes[2].plot([p[0] for p in pts], [t0 * w0 / p[0] for p in pts], color='grey', alpha=0.4, lw=1)
-        axes[0].set(title=f'{command}: steps vs videos ({max_workers} workers)', xlabel='videos', ylabel=unit)
-        axes[1].set(title=f'{command}: steps vs workers ({max_videos:,} videos)', xlabel='workers', ylabel=unit)
-        axes[2].set(title=f'{command}: total vs workers (grey = ideal)', xlabel='workers',
-                    ylabel='wall seconds')
-        for ax, key in zip(axes, ('videos', 'workers', 'workers')):
-            ticks = sorted({run[key] for run in all_runs})
-            ax.set_xscale('log', base=2 if key == 'workers' else 10)
-            ax.set_xticks(ticks, [f'{t:,}' for t in ticks])  # plain numbers, not 2^n
-            ax.minorticks_off()
-            ax.set_yscale('log')
+                        ax.plot(*zip(*pts), marker='o', color=colour[res['label']])
+                ax.set(title=step, xlabel=x_key, ylabel=unit if ci == 0 else None)
+                ax.set_ylim(bottom=0)
+        for ax in fig.axes:
             ax.grid(alpha=0.3)
-            ax.legend(fontsize=6)
-        fig.tight_layout()
+            if ax.get_xlabel() == 'workers':
+                ax.set_xscale('log', base=2)
+                ticks = sorted({r['workers'] for r in all_runs})
+                ax.set_xticks(ticks, [str(t) for t in ticks])
+                ax.minorticks_off()
+        fig.suptitle(f'{command}: row 2 = steps vs videos at {max_workers} workers, '
+                     f'row 3 = steps vs workers at {max_videos:,} videos (colour = run label)')
         out = out_dir / f'{command}.png'
-        fig.savefig(out, dpi=130)
+        fig.savefig(out, dpi=120)
         plt.close(fig)
         print(f'written to {out}')
 
