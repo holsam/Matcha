@@ -5,6 +5,7 @@ Usage:
     uv run python src/matcha/util/bench_stages.py run --label baseline
     uv run python src/matcha/util/bench_stages.py run --label phase1 --match-videos 1000 4000 --workers 1 4 8
     uv run python src/matcha/util/bench_stages.py plot
+    uv run python src/matcha/util/bench_stages.py scaling --label m1 --seconds 60
 
 run saves .local/bench/<label>.json; plot overlays every json in that folder (label = linestyle).
 
@@ -12,7 +13,7 @@ Steps are timed by wrapping module-level functions by name, so the same script w
 across code versions. Steps a version lacks are simply absent from its results.
 '''
 # Import external dependencies
-import argparse, contextlib, io, json, os, shutil, statistics, subprocess, sys, tempfile, threading, time
+import argparse, contextlib, functools, inspect, io, json, os, resource, shutil, statistics, subprocess, sys, tempfile, threading, time
 import numpy as np
 from collections import defaultdict
 from pathlib import Path
@@ -139,15 +140,17 @@ def _match_once(n_videos: int, workers: int, seed: int) -> tuple[dict[str, float
     steps[_MATCH_REST] = max(0.0, wall - sum(steps.values()))
     return steps, rows, frames
 
-# _make_clips: write n_clips distinct short test videos (video + sine audio) into directory
-def _make_clips(directory: Path, n_clips: int, seconds: int) -> list[Path]:
+# _make_clips: write n_clips distinct test videos (H.264 video + sine audio) into directory; noise adds realistic bitrate
+def _make_clips(directory: Path, n_clips: int, seconds: int, *, size: str = '320x240', noise: bool = False) -> list[Path]:
     clips = []
     for i in range(n_clips):
         path = directory / f'src_{i}.mp4'
         subprocess.run(
             ['ffmpeg', '-y', '-loglevel', 'error',
-             '-f', 'lavfi', '-i', f'testsrc2=size=320x240:rate=30:duration={seconds}',
+             '-f', 'lavfi', '-i', f'testsrc2=size={size}:rate=30:duration={seconds}',
              '-f', 'lavfi', '-i', f'sine=frequency={220 + 55 * i}:duration={seconds}',
+             *(['-vf', 'noise=alls=20:allf=t'] if noise else []),
+             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
              '-shortest', '-pix_fmt', 'yuv420p', str(path)],
             check=True,
         )
@@ -156,7 +159,7 @@ def _make_clips(directory: Path, n_clips: int, seconds: int) -> list[Path]:
 
 # _index_once: hard-link n_videos copies of the source clips, run_index once, returns (steps, wall)
 def _index_once(
-    clips: list[Path], n_videos: int, workers: int, *, no_audio: bool
+    clips: list[Path], n_videos: int, workers: int, *, no_audio: bool, hwaccel: bool = False
 ) -> tuple[dict[str, float], float]:
     timer = _Timer()
     with tempfile.TemporaryDirectory(dir=clips[0].parent) as tmp:
@@ -164,10 +167,82 @@ def _index_once(
             os.link(clips[i % len(clips)], os.path.join(tmp, f'video_{i:05d}.mp4'))
         with _quiet(), _instrument(indexer, _INDEX_TARGETS, timer):
             start = time.perf_counter()
-            indexer.run_index(tmp, fps=1.0, workers=workers, no_audio=no_audio)
+            # hard-linked copies would all be reused, so switch that off where this version has it
+            extra = {'reuse_duplicates': False} if 'reuse_duplicates' in inspect.signature(indexer.run_index).parameters else {}
+            indexer.run_index(tmp, fps=1.0, workers=workers, no_audio=no_audio, hwaccel=hwaccel, **extra)
             wall = time.perf_counter() - start
     steps = {name: statistics.fmean(timer.calls[name]) for _, name in _INDEX_TARGETS if name in timer.calls}
     return steps, wall
+
+# _cpu_seconds: CPU time used by this process and its finished children (ffmpeg, ffprobe)
+def _cpu_seconds() -> float:
+    own, kids = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    return own.ru_utime + own.ru_stime + kids.ru_utime + kids.ru_stime
+
+# _scaling_once: one run_index with ffmpeg threads capped, returns (wall seconds, cpu seconds)
+def _scaling_once(
+    clips: list[Path], n_videos: int, workers: int, ffmpeg_threads: int | None, hwaccel: bool
+) -> tuple[float, float]:
+    original = indexer.extract_frame_hashes
+    indexer.extract_frame_hashes = functools.partial(original, threads=ffmpeg_threads)
+    try:
+        cpu_start = _cpu_seconds()
+        _, wall = _index_once(clips, n_videos, workers, no_audio=True, hwaccel=hwaccel)
+        return wall, _cpu_seconds() - cpu_start
+    finally:
+        indexer.extract_frame_hashes = original
+
+# _run_scaling: index wall time, speedup and CPU use over workers x ffmpeg threads, plus a PNG
+def _run_scaling(args: argparse.Namespace) -> None:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    if shutil.which('ffmpeg') is None:
+        sys.exit('ffmpeg not found on PATH')
+    cores = os.cpu_count() or 1
+    rows = []
+    with tempfile.TemporaryDirectory() as clip_dir:
+        clips = _make_clips(Path(clip_dir), args.clips, args.seconds, size=args.size, noise=args.noise)
+        modes = {'off': [False], 'on': [True], 'both': [False, True]}[args.hwaccel]
+        for hw, t in ((hw, t) for hw in modes for t in args.ffmpeg_threads):
+            for w in args.workers:
+                reps = [_scaling_once(clips, args.videos, w, t or None, hw) for _ in range(args.repeats)]
+                wall = statistics.median(r[0] for r in reps)
+                cpu = statistics.median(r[1] for r in reps)
+                rows.append({'hwaccel': hw, 'ffmpeg_threads': t, 'workers': w, 'wall': wall, 'cpu': cpu,
+                             'cpu_util': cpu / (wall * cores)})
+                print(f'hwaccel={"on" if hw else "off":<4} ffmpeg-threads={t or "default":<8} workers={w:<3} wall={wall:6.2f}s  '
+                      f'cpu={cpu:6.2f}s  cpu use={rows[-1]["cpu_util"]:5.0%} of {cores} cores', flush=True)
+    out_dir = _OUT_DIR / 'scaling'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f'{args.label}.json').write_text(json.dumps(
+        {'label': args.label, 'cores': cores, 'videos': args.videos, 'seconds': args.seconds, 'rows': rows}, indent=2))
+
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5), constrained_layout=True)
+    for i, (hw, t) in enumerate((hw, t) for hw in modes for t in args.ffmpeg_threads):
+        mine = sorted((r for r in rows if r['ffmpeg_threads'] == t and r['hwaccel'] == hw), key=lambda r: r['workers'])
+        xs = [r['workers'] for r in mine]
+        name = f'hwaccel {"on" if hw else "off"}, threads: {t or "default"}'
+        axes[0].plot(xs, [r['wall'] for r in mine], marker='o', color=f'C{i}', label=name)
+        axes[1].plot(xs, [mine[0]['wall'] / r['wall'] for r in mine], marker='o', color=f'C{i}', label=name)
+        axes[2].plot(xs, [r['cpu_util'] * 100 for r in mine], marker='o', color=f'C{i}', label=name)
+    axes[1].plot(args.workers, args.workers, color='grey', ls=':', label='ideal')
+    axes[0].set(title='wall time', ylabel='seconds')
+    axes[1].set(title='speedup vs 1 worker (same ffmpeg threads)', ylabel='x')
+    axes[2].set(title=f'CPU use ({cores} cores)', ylabel='% of all cores')
+    axes[2].axhline(100, color='grey', ls=':')
+    for ax in axes:
+        ax.set(xlabel='workers')
+        ax.set_xscale('log', base=2)
+        ax.set_xticks(args.workers, [str(w) for w in args.workers])
+        ax.minorticks_off()
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=11)
+    fig.suptitle(f'index scaling: {args.videos} videos of {args.seconds}s at {args.size}, {cores} cores')
+    out = out_dir / f'{args.label}.png'
+    fig.savefig(out, dpi=120)
+    print(f'\nwritten to {out}')
 
 # _median_steps: per-step median across repeats
 def _median_steps(runs: list[dict[str, float]]) -> dict[str, float]:
@@ -333,11 +408,26 @@ def main() -> None:
     p_run.add_argument('--seconds', type=int, default=20, help='clip length')
     p_run.add_argument('--no-audio', action='store_true')
 
+    p_scale = sub.add_parser('scaling', help='index wall time and CPU use over workers x ffmpeg threads, with a plot')
+    p_scale.add_argument('--label', default='scaling')
+    p_scale.add_argument('--videos', type=int, default=32)
+    p_scale.add_argument('--workers', type=int, nargs='+', default=[1, 2, 4, 8])
+    p_scale.add_argument('--ffmpeg-threads', type=int, nargs='+', default=[0, 1, 2, 4], help='0 = ffmpeg default')
+    p_scale.add_argument('--repeats', type=int, default=1)
+    p_scale.add_argument('--clips', type=int, default=4)
+    p_scale.add_argument('--seconds', type=int, default=60, help='clip length; longer clips show decode-bound scaling')
+    p_scale.add_argument('--hwaccel', choices=['off', 'on', 'both'], default='off', help='pass -hwaccel auto to ffmpeg')
+    p_scale.add_argument('--size', default='320x240', help='source resolution, e.g. 1920x1080')
+    p_scale.add_argument('--noise', action='store_true', help='add noise so the bitrate looks like real footage')
+
     sub.add_parser('plot', help='plot every result file in .local/bench together')
 
     args = parser.parse_args()
     if args.cmd == 'plot':
         _plot(args)
+        return
+    if args.cmd == 'scaling':
+        _run_scaling(args)
         return
     commands = {}
     if args.only != 'index':

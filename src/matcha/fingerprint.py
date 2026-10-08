@@ -30,6 +30,7 @@ def extract_frame_hashes(
     video_path: str,
     fps: float = 1.0,
     hwaccel: bool = False,
+    threads: int | None = None,
 ) -> list[tuple[float, str]]:
     """
     Extract frames from a video at `fps` frames per second.
@@ -43,6 +44,9 @@ def extract_frame_hashes(
     If hwaccel=True, passes -hwaccel auto to ffmpeg (on Mac this uses
     VideoToolbox). Falls back silently to software decoding if unavailable.
 
+    threads caps ffmpeg's decode and filter threads (None = ffmpeg's default,
+    which uses every core per process; lower it when running many workers).
+
     The scale filter (160:120) reduces decode work for high-resolution
     videos — pHash only needs a small image, so full-resolution frames
     are unnecessary.
@@ -52,6 +56,8 @@ def extract_frame_hashes(
     cmd = ["ffmpeg"]
     if hwaccel:
         cmd += ["-hwaccel", "auto"]
+    if threads is not None:
+        cmd += ["-threads", str(threads), "-filter_threads", str(threads)]
     cmd += [
         "-i", video_path,
         "-vf", f"fps={fps},scale={_FRAME_SIZE[0]}:{_FRAME_SIZE[1]}",
