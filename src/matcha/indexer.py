@@ -13,6 +13,7 @@ from matcha.config import save_run_config
 from matcha.db import get_connection, init_schema
 from matcha.fingerprint import (
     VIDEO_EXTENSIONS,
+    content_key,
     extract_frame_hashes,
     get_audio_fingerprint,
     get_video_duration,
@@ -109,19 +110,58 @@ def get_unprocessed(db_path: str) -> list[tuple[int, str]]:
     ).fetchall()
     return [(row["id"], row["path"]) for row in rows]
 
+# _copy_from_duplicate: reuse stored hashes of an identical, already indexed file; True if reused
+def _copy_from_duplicate(conn, video_id: int, key: str, fps: float, no_audio: bool) -> bool:
+    src = conn.execute(
+        """
+        SELECT id, duration FROM videos
+        WHERE content_key = ? AND fingerprinted_at IS NOT NULL AND id != ?
+        ORDER BY id LIMIT 1
+        """,
+        (key, video_id),
+    ).fetchone()
+    if src is None:
+        return False
+    frames = conn.execute("SELECT COUNT(*) FROM frame_hashes WHERE video_id = ?", (src["id"],)).fetchone()[0]
+    if abs(frames - (src["duration"] or 0) * fps) > 2:
+        return False  # source was indexed at a different fps
+    has_audio = conn.execute("SELECT 1 FROM audio_fingerprints WHERE video_id = ?", (src["id"],)).fetchone()
+    if not no_audio and has_audio is None:
+        return False  # can't tell "no audio track" from "audio skipped", so decode
+    with conn:
+        conn.execute("UPDATE videos SET duration = ?, content_key = ? WHERE id = ?", (src["duration"], key, video_id))
+        conn.execute(
+            "INSERT INTO frame_hashes (video_id, timestamp, phash) "
+            "SELECT ?, timestamp, phash FROM frame_hashes WHERE video_id = ? ORDER BY timestamp",
+            (video_id, src["id"]),
+        )
+        if has_audio is not None and not no_audio:
+            conn.execute(
+                "INSERT OR REPLACE INTO audio_fingerprints (video_id, duration, fingerprint) "
+                "SELECT ?, duration, fingerprint FROM audio_fingerprints WHERE video_id = ?",
+                (video_id, src["id"]),
+            )
+        conn.execute("UPDATE videos SET fingerprinted_at = ? WHERE id = ?", (time.time(), video_id))
+    return True
+
 def process_video(args: tuple) -> tuple[str, str | None]:
     """
     Worker — runs in a thread. Sets its status line before and after
     processing so the Live display reflects what each worker is doing.
     Returns (video_path, error_message).
     """
-    video_id, video_path, db_path, fps, no_audio, hwaccel = args
+    video_id, video_path, db_path, fps, no_audio, hwaccel, reuse_duplicates = args
     _set_status(os.path.basename(video_path))
     conn = _get_conn(db_path)
 
     try:
         if _stop_event.is_set():
             return video_path, "cancelled"
+
+        key = content_key(video_path) if reuse_duplicates else None
+        if key is not None and _copy_from_duplicate(conn, video_id, key, fps, no_audio):
+            _set_status(None)
+            return video_path, None
 
         duration = get_video_duration(video_path)
 
@@ -140,8 +180,8 @@ def process_video(args: tuple) -> tuple[str, str | None]:
 
         with conn:
             conn.execute(
-                "UPDATE videos SET duration = ? WHERE id = ?",
-                (duration, video_id),
+                "UPDATE videos SET duration = ?, content_key = ? WHERE id = ?",
+                (duration, key, video_id),
             )
             conn.executemany(
                 "INSERT INTO frame_hashes (video_id, timestamp, phash) VALUES (?, ?, ?)",
@@ -209,6 +249,7 @@ def run_index(
     workers: int = 4,
     no_audio: bool = False,
     hwaccel: bool = False,
+    reuse_duplicates: bool = True,
 ):
     _reset_worker_state()
     directory = os.path.abspath(directory)
@@ -218,6 +259,7 @@ def run_index(
         "workers": workers,
         "no_audio": no_audio,
         "hwaccel": hwaccel,
+        "reuse_duplicates": reuse_duplicates,
     })
     db_dir = os.path.join(directory, ".matcha")
     os.makedirs(db_dir, exist_ok=True)
@@ -243,7 +285,7 @@ def run_index(
     console.print(f"[dim]Press [bold]q[/bold] to quit indexing before completion.[/dim]\n")
 
     args = [
-        (vid_id, path, db_path, fps, no_audio, hwaccel)
+        (vid_id, path, db_path, fps, no_audio, hwaccel, reuse_duplicates)
         for vid_id, path in to_process
     ]
 

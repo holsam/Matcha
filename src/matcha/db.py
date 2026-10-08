@@ -38,7 +38,8 @@ def init_schema(db_path: str):
                 path             TEXT UNIQUE NOT NULL,
                 duration         REAL,
                 fingerprinted_at REAL,
-                moved_to         TEXT
+                moved_to         TEXT,
+                content_key      TEXT                -- size + sampled hash, for reusing hashes of identical files
             );
 
             CREATE TABLE IF NOT EXISTS frame_hashes (
@@ -100,6 +101,10 @@ def init_schema(db_path: str):
                 nprobe      INTEGER NOT NULL
             );
         """)
+        # databases created before content_key existed
+        if 'content_key' not in {row['name'] for row in conn.execute("PRAGMA table_info(videos)")}:
+            conn.execute("ALTER TABLE videos ADD COLUMN content_key TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_content_key ON videos(content_key)")
 
 def get_faiss_meta(db_path: str) -> dict | None:
     conn = get_connection(db_path)

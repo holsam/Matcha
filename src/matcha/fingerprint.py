@@ -1,7 +1,25 @@
-import acoustid, imagehash, subprocess, tempfile
+import acoustid, hashlib, imagehash, os, subprocess, tempfile
 from PIL import Image
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}
+
+
+# _SAMPLE_BYTES: bytes read from the head, middle and tail of a file for its content key
+_SAMPLE_BYTES = 256 * 1024
+
+
+# content_key: size plus a hash of three samples; equal keys mean the files are almost certainly byte-identical
+def content_key(path: str) -> str | None:
+    try:
+        size = os.path.getsize(path)
+        digest = hashlib.blake2b(digest_size=16)
+        with open(path, "rb") as f:
+            for offset in (0, max(0, size // 2 - _SAMPLE_BYTES // 2), max(0, size - _SAMPLE_BYTES)):
+                f.seek(offset)
+                digest.update(f.read(_SAMPLE_BYTES))
+        return f"{size}:{digest.hexdigest()}"
+    except OSError:
+        return None
 
 
 # _FRAME_SIZE: (width, height) of frames piped from ffmpeg, matching the scale filter below

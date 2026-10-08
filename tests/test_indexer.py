@@ -1,3 +1,4 @@
+from pathlib import Path
 import pytest
 
 from matcha.db import get_connection
@@ -140,3 +141,38 @@ class TestCheckpointing:
             for r in conn.execute("SELECT path, fingerprinted_at FROM videos").fetchall()
         }
         assert before == after
+
+class TestReuseDuplicates:
+    def _setup(self, video_dir, tmp_path):
+        import shutil
+        src = sorted(video_dir["dir"].glob("*.mp4"))
+        shutil.copy(src[0], tmp_path / "a.mp4")
+        shutil.copy(src[0], tmp_path / "a_copy.mp4")  # byte-identical
+        shutil.copy(src[1], tmp_path / "b.mp4")
+        return tmp_path
+
+    def test_identical_file_reuses_hashes(self, video_dir, tmp_path, monkeypatch):
+        import matcha.indexer as indexer
+        directory = self._setup(video_dir, tmp_path)
+        calls = []
+        real = indexer.extract_frame_hashes
+        monkeypatch.setattr(indexer, "extract_frame_hashes", lambda *a, **k: calls.append(a[0]) or real(*a, **k))
+        run_index(str(directory), fps=1.0, workers=1, no_audio=True)  # one worker so the copy sees the original
+        assert len(calls) == 2  # a and b decoded, the copy reused
+        conn = get_connection(str(directory / ".matcha" / "index.db"))
+        hashes = {
+            Path(r["path"]).name: [x["phash"] for x in conn.execute(
+                "SELECT phash FROM frame_hashes WHERE video_id = ? ORDER BY timestamp", (r["id"],))]
+            for r in conn.execute("SELECT id, path FROM videos")
+        }
+        assert hashes["a.mp4"] == hashes["a_copy.mp4"] and hashes["a.mp4"]
+        assert hashes["a.mp4"] != hashes["b.mp4"]
+
+    def test_disabled_decodes_every_file(self, video_dir, tmp_path, monkeypatch):
+        import matcha.indexer as indexer
+        directory = self._setup(video_dir, tmp_path)
+        calls = []
+        real = indexer.extract_frame_hashes
+        monkeypatch.setattr(indexer, "extract_frame_hashes", lambda *a, **k: calls.append(a[0]) or real(*a, **k))
+        run_index(str(directory), fps=1.0, workers=1, no_audio=True, reuse_duplicates=False)
+        assert len(calls) == 3
