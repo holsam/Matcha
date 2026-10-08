@@ -61,7 +61,7 @@ def extract_frame_hashes(
     cmd += [
         "-i", video_path,
         "-vf", f"fps={fps},scale={_FRAME_SIZE[0]}:{_FRAME_SIZE[1]}",
-        "-vsync", "vfr",
+        "-fps_mode", "vfr",
         "-pix_fmt", "rgb24",
         "-f", "rawvideo",
         "-loglevel", "error",
