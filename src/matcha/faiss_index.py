@@ -29,9 +29,32 @@ def _print_message(stage: str, msg: str):
     print_msg = f'({ts})'+'\t'*tab+f'{msg}'
     print(f'[dim]{print_msg}[/dim]')
 
-def _hex_to_bytes(hex_str: str) -> bytes:
-    """Convert a 16-character hex pHash string to 8 packed bytes."""
-    return bytes.fromhex(hex_str)
+# _train_sample_size: IVF training needs roughly 40+ points per cell, not every vector
+def _train_sample_size(nlist: int) -> int:
+    return max(nlist * 40, 100_000)
+
+# _hashes_to_vectors: 16-char hex pHashes to an (n, 8) uint8 array for FAISS
+def _hashes_to_vectors(phashes: list[str]) -> np.ndarray:
+    if not phashes:
+        return np.empty((0, 8), dtype=np.uint8)
+    # bytearray so the array is writeable and contiguous
+    return np.frombuffer(bytearray(bytes.fromhex(''.join(phashes))), dtype=np.uint8).reshape(-1, 8)
+
+# _build_id_map: (video_id, frame number) per row; rows must be ordered so each video is contiguous
+def _build_id_map(video_ids: np.ndarray) -> np.ndarray:
+    if len(video_ids) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    run_start = np.flatnonzero(np.r_[True, video_ids[1:] != video_ids[:-1]])
+    run_len = np.diff(np.r_[run_start, len(video_ids)])
+    frame_no = np.arange(len(video_ids)) - np.repeat(run_start, run_len)
+    return np.column_stack([video_ids, frame_no]).astype(np.int64)
+
+# _split_rows: (video_id, phash) rows to (video id array, FAISS vectors)
+def _split_rows(rows) -> tuple[np.ndarray, np.ndarray]:
+    if not rows:
+        return np.empty(0, dtype=np.int64), np.empty((0, 8), dtype=np.uint8)
+    video_ids, phashes = zip(*rows)
+    return np.array(video_ids, dtype=np.int64), _hashes_to_vectors(list(phashes))
 
 def _load_all_hashes(db_path: str) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -43,40 +66,23 @@ def _load_all_hashes(db_path: str) -> tuple[np.ndarray, np.ndarray]:
         FROM frame_hashes
         ORDER BY video_id, timestamp
     """).fetchall()
-    if not rows:
-        return np.empty((0, 8), dtype=np.uint8), np.empty((0, 2), dtype=np.int64)
-    vectors = np.array([list(_hex_to_bytes(r["phash"])) for r in rows], dtype=np.uint8)
-    frame_counter: dict[int, int] = {}
-    id_map_rows = []
-    for r in rows:
-        vid = r["video_id"]
-        frame_counter[vid] = frame_counter.get(vid, 0)
-        id_map_rows.append([vid, frame_counter[vid]])
-        frame_counter[vid] += 1
-    id_map = np.array(id_map_rows, dtype=np.int64)
-    return vectors, id_map
+    video_ids, vectors = _split_rows(rows)
+    return vectors, _build_id_map(video_ids)
 
 def _query_batch(args: tuple) -> tuple[set[tuple[int, int]], set[int]]:
     """Process a single batch of queries. Returns (candidate pairs, video_ids covered) for this batch."""
     batch, batch_vids, index, id_map, k, threshold = args
     distances, labels = index.search(batch, k)
-    pairs = set()
-    for i, (dists, lbls) in enumerate(zip(distances, labels)):
-        query_vid = int(batch_vids[i])
-        for dist, lbl in zip(dists, lbls):
-            if lbl < 0:
-                continue
-            if dist > threshold:
-                continue
-            candidate_vid = int(id_map[lbl, 0])
-            if candidate_vid < 0:
-                continue  # tombstoned
-            if candidate_vid == query_vid:
-                continue
-            pair = (min(query_vid, candidate_vid), max(query_vid, candidate_vid))
-            pairs.add(pair)
-    covered_vids = {int(v) for v in batch_vids}
-    return pairs, covered_vids
+    valid = (labels >= 0) & (distances <= threshold)
+    query_vids = np.broadcast_to(batch_vids[:, None], labels.shape)[valid]
+    candidate_vids = id_map[labels[valid], 0]
+    keep = (candidate_vids >= 0) & (candidate_vids != query_vids)  # drop tombstoned and same-video hits
+    lo = np.minimum(query_vids[keep], candidate_vids[keep])
+    hi = np.maximum(query_vids[keep], candidate_vids[keep])
+    # pack each pair into one int so np.unique dedupes it; video ids fit in 32 bits
+    packed = np.unique((lo << 32) | hi)
+    pairs = set(zip((packed >> 32).tolist(), (packed & 0xFFFFFFFF).tolist()))
+    return pairs, set(np.unique(batch_vids).tolist())
 
 def _index_paths(index_dir: str) -> tuple[str, str]:
     """Return (faiss_path, map_path) for a given index directory."""
@@ -153,31 +159,23 @@ def _load_new_hashes(
 
     Rows are read in the same (video_id, timestamp) order used everywhere
     else, so the appended ID-map rows line up with the order FAISS assigns to
-    the new vectors.
+    the new vectors. Known videos are filtered out in SQL via a temp table.
     """
     conn = get_connection(db_path)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS known_videos (video_id INTEGER PRIMARY KEY)")
+    conn.execute("DELETE FROM known_videos")
+    conn.executemany("INSERT INTO known_videos VALUES (?)", [(v,) for v in known_video_ids])
     rows = conn.execute(
         """
-        SELECT video_id, phash
-        FROM frame_hashes
-        ORDER BY video_id, timestamp
+        SELECT fh.video_id, fh.phash
+        FROM frame_hashes fh
+        LEFT JOIN known_videos k ON k.video_id = fh.video_id
+        WHERE k.video_id IS NULL
+        ORDER BY fh.video_id, fh.timestamp
         """
     ).fetchall()
-    rows = [r for r in rows if r["video_id"] not in known_video_ids]
-    if not rows:
-        return np.empty((0, 8), dtype=np.uint8), np.empty((0, 2), dtype=np.int64)
-    vectors = np.array(
-        [list(_hex_to_bytes(r["phash"])) for r in rows], dtype=np.uint8
-    )
-    frame_counter: dict[int, int] = {}
-    id_map_rows = []
-    for r in rows:
-        vid = r["video_id"]
-        frame_counter[vid] = frame_counter.get(vid, 0)
-        id_map_rows.append([vid, frame_counter[vid]])
-        frame_counter[vid] += 1
-    id_map = np.array(id_map_rows, dtype=np.int64)
-    return vectors, id_map
+    video_ids, vectors = _split_rows(rows)
+    return vectors, _build_id_map(video_ids)
 
 def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
     """Train and build the index from scratch over all frame hashes."""
@@ -194,7 +192,13 @@ def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> b
     quantiser = faiss.IndexBinaryFlat(d)
     index = faiss.IndexBinaryIVF(quantiser, d, nlist)
     index.nprobe = nprobe
-    index.train(vectors)
+    train_n = _train_sample_size(nlist)
+    if train_n < n:
+        # train on a random sample, then add every vector
+        sample = np.sort(np.random.default_rng(0).choice(n, size=train_n, replace=False))
+        index.train(vectors[sample])
+    else:
+        index.train(vectors)
     index.add_with_ids(vectors, np.arange(n, dtype=np.int64))
 
     faiss_path, map_path = _index_paths(index_dir)
@@ -300,10 +304,7 @@ def find_candidate_pairs(
         _print_message('2.3.2', 'No new videos to query — all already searched.')
         return set(), False
 
-    vectors = np.array(
-        [list(_hex_to_bytes(r["phash"])) for r in all_hashes_rows], dtype=np.uint8
-    )
-    query_video_ids = np.array([r["video_id"] for r in all_hashes_rows], dtype=np.int64)
+    query_video_ids, vectors = _split_rows(all_hashes_rows)
     k = 16  # number of nearest neighbours per query frame
 
     _print_message('2.3.3', 'Defining batches...')
