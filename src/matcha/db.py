@@ -101,9 +101,11 @@ def init_schema(db_path: str):
                 nprobe      INTEGER NOT NULL
             );
         """)
-        # databases created before content_key existed
-        if 'content_key' not in {row['name'] for row in conn.execute("PRAGMA table_info(videos)")}:
-            conn.execute("ALTER TABLE videos ADD COLUMN content_key TEXT")
+        # databases created before these columns existed (moved_to: <1.5.3, content_key: <2.1)
+        cols = {row['name'] for row in conn.execute("PRAGMA table_info(videos)")}
+        for col in ('moved_to', 'content_key'):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE videos ADD COLUMN {col} TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_content_key ON videos(content_key)")
 
 def get_faiss_meta(db_path: str) -> dict | None:
