@@ -83,6 +83,17 @@ def init_schema(db_path: str):
                 generated   INTEGER NOT NULL DEFAULT 0,   -- 1 once Pass 1 has emitted this pair
                 PRIMARY KEY (video_a_id, video_b_id)
             );
+
+            CREATE TABLE IF NOT EXISTS candidate_search_progress (
+                video_id    INTEGER PRIMARY KEY REFERENCES videos(id),
+                queried_at  REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS candidate_search_params (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),  -- enforce single row
+                threshold   INTEGER NOT NULL,
+                nprobe      INTEGER NOT NULL
+            );
         """)
 
 def get_faiss_meta(db_path: str) -> dict | None:

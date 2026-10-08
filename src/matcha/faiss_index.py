@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 from rich import print
 from tqdm import tqdm
 
-from matcha.db import get_connection, set_faiss_meta
+from matcha.db import get_connection, init_schema, set_faiss_meta
 from matcha.interactive import watch_for_quit
 
 # Number of IVF cells. Rule of thumb: sqrt(N) where N is total vector count.
 # This is recalculated at build time; this is just a fallback default.
-_DEFAULT_NLIST = 100
+_NLIST_MULTIPLIER = 1.5
+_MIN_NLIST = 100
 
 # How many IVF cells to probe at query time (higher = more accurate but slower).
 DEFAULT_NPROBE = 32
@@ -18,6 +19,9 @@ DEFAULT_NPROBE = 32
 # Rebuild guard variables. A full rebuild is worthwhile when the trained IVF cell count has fallen well behind the ideal for the current size, or when tombstones from removals have built up. Both slow queries down; a rebuild restores the ideal shape and compacts the ID map.
 _REBUILD_NLIST_GROWTH = 2.0
 _REBUILD_TOMBSTONE_FRACTION = 0.25
+
+def _target_nlist(n: int) -> int:
+    return max(_MIN_NLIST, int(_NLIST_MULTIPLIER * (n ** 0.5)))
 
 def _print_message(stage: str, msg: str):
     ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
@@ -81,22 +85,6 @@ def _index_paths(index_dir: str) -> tuple[str, str]:
         os.path.join(index_dir, "frame_index_map.npy"),
     )
 
-def _ensure_progress_tables(conn):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS candidate_search_progress (
-            video_id INTEGER PRIMARY KEY,
-            queried_at REAL NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS candidate_search_params (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            threshold INTEGER NOT NULL,
-            nprobe INTEGER NOT NULL
-        )
-    """)
-    conn.commit()
-
 def _reset_progress_if_params_changed(conn, threshold: int, nprobe: int):
     """
     Candidate-search progress is only valid for the threshold/nprobe it was
@@ -122,7 +110,6 @@ def _reset_progress_if_params_changed(conn, threshold: int, nprobe: int):
 
 def get_queried_video_ids(db_path: str) -> set[int]:
     conn = get_connection(db_path)
-    _ensure_progress_tables(conn)
     rows = conn.execute("SELECT video_id FROM candidate_search_progress").fetchall()
     return {row["video_id"] for row in rows}
 
@@ -199,10 +186,10 @@ def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> b
     if current_count == 0:
         return False  # nothing to index yet
 
-    print(f"Building FAISS index over {current_count:,} frame hashes...")
+    _print_message('2.2', f"Building FAISS index over {current_count:,} frame hashes...")
     vectors, id_map = _load_all_hashes(db_path)
     n = len(vectors)
-    nlist = max(1, min(_DEFAULT_NLIST, int(n ** 0.5)))
+    nlist = _target_nlist(n)
     d = 64  # 64-bit pHash -> 64 binary dimensions
     quantiser = faiss.IndexBinaryFlat(d)
     index = faiss.IndexBinaryIVF(quantiser, d, nlist)
@@ -214,7 +201,7 @@ def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> b
     faiss.write_index_binary(index, faiss_path)
     np.save(map_path, id_map)
     set_faiss_meta(db_path, n)
-    print(f"FAISS index saved ({n:,} vectors, {nlist} IVF cells).")
+    _print_message('2.2', f"FAISS index saved ({n:,} vectors, {nlist} IVF cells).")
     return True
 
 def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
@@ -245,7 +232,7 @@ def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> 
     if len(new_vectors) == 0:
         return False  # already up to date
 
-    print(f"Appending {len(new_vectors):,} new frame hashes to the FAISS index...")
+    _print_message('2.2', f"Appending {len(new_vectors):,} new frame hashes to the FAISS index...")
     start = int(id_map.shape[0]) if id_map.size else 0
     ids = np.arange(start, start + len(new_vectors), dtype=np.int64)
     index.add_with_ids(new_vectors, ids)
@@ -254,7 +241,7 @@ def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> 
     faiss.write_index_binary(index, faiss_path)
     np.save(map_path, id_map)
     set_faiss_meta(db_path, len(id_map))
-    print(f"FAISS index updated ({len(id_map):,} vectors total).")
+    _print_message('2.2', f"FAISS index updated ({len(id_map):,} vectors total).")
     return True
 
 def load_index(index_dir: str) -> tuple[faiss.IndexBinaryIVF, np.ndarray]:
@@ -292,33 +279,22 @@ def find_candidate_pairs(
     re-returned here — callers wanting the full set should read the table.
     """
     conn = get_connection(db_path)
-    _ensure_progress_tables(conn)
+    init_schema(db_path)  # DBs predating the progress tables lack them
     _reset_progress_if_params_changed(conn, threshold, nprobe)
 
     _print_message('2.3.1', 'Loading index...')
     index, id_map = load_index(index_dir)
     index.nprobe = nprobe
 
-    already_queried = get_queried_video_ids(db_path)
+    _print_message('2.3.2', 'Retrieving videos and perceptual hashes...')
 
-    _print_message('2.3.2', 'Retrieved videos and perceptual hashes...')
-    if already_queried:
-        placeholders = ",".join(["?"] * len(already_queried))
-        all_hashes_rows = conn.execute(
-            f"""
-            SELECT video_id, phash
-            FROM frame_hashes
-            WHERE video_id NOT IN ({placeholders})
-            ORDER BY video_id, timestamp
-            """,
-            tuple(already_queried),
-        ).fetchall()
-    else:
-        all_hashes_rows = conn.execute("""
-            SELECT video_id, phash
-            FROM frame_hashes
-            ORDER BY video_id, timestamp
-        """).fetchall()
+    all_hashes_rows = conn.execute("""
+        SELECT fh.video_id, fh.phash
+        FROM frame_hashes fh
+        LEFT JOIN candidate_search_progress p ON p.video_id = fh.video_id
+        WHERE p.video_id IS NULL
+        ORDER BY fh.video_id, fh.timestamp
+    """).fetchall()
 
     if not all_hashes_rows:
         _print_message('2.3.2', 'No new videos to query — all already searched.')
@@ -409,8 +385,8 @@ def remove_videos_from_index(index_dir: str, video_ids) -> int:
     db_path = os.path.join(index_dir, "index.db")
     set_faiss_meta(db_path, int(index.ntotal))
 
+    init_schema(db_path)  # DBs predating the progress tables lack them
     conn = get_connection(db_path)
-    _ensure_progress_tables(conn)
     placeholders = ",".join(["?"] * len(wanted))
     with conn:
         conn.execute(
@@ -428,7 +404,7 @@ def rebuild_recommended(index, id_map) -> tuple[bool, str]:
         return False, ""
 
     trained_nlist = int(index.nlist)
-    ideal_nlist = max(1, min(_DEFAULT_NLIST, int(live ** 0.5)))
+    ideal_nlist = _target_nlist(live)
     if ideal_nlist > trained_nlist and ideal_nlist >= _REBUILD_NLIST_GROWTH * trained_nlist:
         return True, f"IVF cells {trained_nlist} -> {ideal_nlist} for {live:,} live vectors"
 
@@ -457,5 +433,5 @@ def maybe_rebuild_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPRO
     if not should:
         return False
 
-    print(f"Rebuilding FAISS index ({reason})...")
+    _print_message('2.2', f"Rebuilding FAISS index ({reason})...")
     return _full_build(db_path, index_dir, nprobe)
