@@ -1,4 +1,4 @@
-import imagehash, io, itertools, os, sys, termios, threading, time, tty, typer
+import imagehash, itertools, os, threading, time, typer
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ from tqdm import tqdm
 from matcha.config import save_run_config
 from matcha.db import get_connection
 from matcha.faiss_index import update_index, maybe_rebuild_index, find_candidate_pairs
+from matcha.interactive import watch_for_quit
 
 @dataclass
 class VideoRecord:
@@ -190,35 +191,6 @@ def _compare_pair(args: tuple) -> tuple[int, int, float]:
     confidence = sliding_window_match_numpy(short_hashes, long_hashes, frame_step, threshold)
     return short_id, long_id, confidence
 
-
-def _watch_for_quit(stop_event: threading.Event):
-    """
-    Background thread that sets stop_event when 'q' is pressed.
-
-    Puts stdin into raw (unbuffered, no-echo) mode so keypresses are
-    received immediately without the user pressing Enter. Restores the
-    original terminal settings on exit regardless of how it ends.
-    """
-    fd = sys.stdin.fileno()
-    try:
-        old_settings = termios.tcgetattr(fd)
-    except (termios.error, io.UnsupportedOperation): 
-        # stdin is not a tty (e.g. in tests or piped input) — skip listener
-        return
-    try:
-        tty.setraw(fd)
-        while not stop_event.is_set():
-            # os.read is non-blocking after setraw; use select to avoid busy-wait
-            import select
-            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if readable:
-                ch = os.read(fd, 1)
-                if ch in (b"q", b"Q"):
-                    stop_event.set()
-                    break
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
 def run_match(
     directory: str,
     filter_length: bool = False,
@@ -266,21 +238,23 @@ def run_match(
     if maybe_rebuild_index(db_path, index_dir, nprobe):
         _print_message('2.1', 'FAISS index rebuilt to restore query speed.')
     conn = get_connection(db_path)
-    existing_candidates: set[tuple[int, int]] = {
-        (row['video_a_id'], row['video_b_id']) for row in conn.execute('SELECT video_a_id, video_b_id FROM candidate_pairs').fetchall()
-    }
     _print_message('2.3', 'Querying FAISS index for candidate pairs...')
-    new_candidates = find_candidate_pairs(db_path, index_dir, threshold, nprobe, workers)
-    all_candidates = existing_candidates | new_candidates
-    new_to_write = new_candidates - existing_candidates
-    if new_to_write:
-        _print_message('2.4', 'Writing new candidates to index...')
-        with conn:
-            conn.executemany(
-                'INSERT OR IGNORE INTO candidate_pairs (video_a_id, video_b_id) VALUES (?, ?)',
-                list(new_to_write),
-            )
-        _print_message('2', f'{len(all_candidates):,} candidate pairs identified.')
+    new_candidates, candidates_stopped_early = find_candidate_pairs(
+        db_path,
+        index_dir,
+        threshold=threshold,
+        nprobe=nprobe,
+        batch_size=10_000,
+        workers=workers,
+    )
+    if candidates_stopped_early:
+        typer.echo("\nStopped early during candidate search. Progress has been saved — resume with `matcha match`.")
+        return
+    all_candidates: set[tuple[int, int]] = {
+        (row['video_a_id'], row['video_b_id'])
+        for row in conn.execute('SELECT video_a_id, video_b_id FROM candidate_pairs').fetchall()
+    }
+    _print_message('2', f'{len(all_candidates):,} candidate pairs identified ({len(new_candidates):,} new this run).')
     # Pass 2
     _print_message('3', 'Starting Pass 2 (candidate comparisons)...')
     already_compared = get_compared_pairs(db_path)
@@ -323,7 +297,7 @@ def run_match(
     matches_found = 0
     stopped_early = False
     stop_event = threading.Event()
-    quit_thread = threading.Thread(target=_watch_for_quit, args=(stop_event,), daemon=True)
+    quit_thread = threading.Thread(target=watch_for_quit, args=(stop_event,), daemon=True)
     quit_thread.start()
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_compare_pair, arg): arg for arg in worker_args}

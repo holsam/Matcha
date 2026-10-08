@@ -1,14 +1,17 @@
-import faiss, os
+import faiss, os, threading, time
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from rich import print
 from tqdm import tqdm
 
-from .db import get_connection, set_faiss_meta
+from matcha.db import get_connection, init_schema, set_faiss_meta
+from matcha.interactive import watch_for_quit
 
 # Number of IVF cells. Rule of thumb: sqrt(N) where N is total vector count.
 # This is recalculated at build time; this is just a fallback default.
-_DEFAULT_NLIST = 100
+_NLIST_MULTIPLIER = 1.5
+_MIN_NLIST = 100
 
 # How many IVF cells to probe at query time (higher = more accurate but slower).
 DEFAULT_NPROBE = 32
@@ -16,6 +19,9 @@ DEFAULT_NPROBE = 32
 # Rebuild guard variables. A full rebuild is worthwhile when the trained IVF cell count has fallen well behind the ideal for the current size, or when tombstones from removals have built up. Both slow queries down; a rebuild restores the ideal shape and compacts the ID map.
 _REBUILD_NLIST_GROWTH = 2.0
 _REBUILD_TOMBSTONE_FRACTION = 0.25
+
+def _target_nlist(n: int) -> int:
+    return max(_MIN_NLIST, int(_NLIST_MULTIPLIER * (n ** 0.5)))
 
 def _print_message(stage: str, msg: str):
     ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
@@ -50,8 +56,8 @@ def _load_all_hashes(db_path: str) -> tuple[np.ndarray, np.ndarray]:
     id_map = np.array(id_map_rows, dtype=np.int64)
     return vectors, id_map
 
-def _query_batch(args: tuple) -> set[tuple[int, int]]:
-    """Process a single batch of queries. Returns candidate pairs found in this batch."""
+def _query_batch(args: tuple) -> tuple[set[tuple[int, int]], set[int]]:
+    """Process a single batch of queries. Returns (candidate pairs, video_ids covered) for this batch."""
     batch, batch_vids, index, id_map, k, threshold = args
     distances, labels = index.search(batch, k)
     pairs = set()
@@ -69,7 +75,8 @@ def _query_batch(args: tuple) -> set[tuple[int, int]]:
                 continue
             pair = (min(query_vid, candidate_vid), max(query_vid, candidate_vid))
             pairs.add(pair)
-    return pairs
+    covered_vids = {int(v) for v in batch_vids}
+    return pairs, covered_vids
 
 def _index_paths(index_dir: str) -> tuple[str, str]:
     """Return (faiss_path, map_path) for a given index directory."""
@@ -77,6 +84,66 @@ def _index_paths(index_dir: str) -> tuple[str, str]:
         os.path.join(index_dir, "frame_index.faiss"),
         os.path.join(index_dir, "frame_index_map.npy"),
     )
+
+def _reset_progress_if_params_changed(conn, threshold: int, nprobe: int):
+    """
+    Candidate-search progress is only valid for the threshold/nprobe it was
+    recorded under — both affect which neighbours pass the filter. If either
+    has changed since the last run, drop all progress so every video gets
+    re-queried under the new parameters.
+    """
+    row = conn.execute(
+        "SELECT threshold, nprobe FROM candidate_search_params WHERE id = 1"
+    ).fetchone()
+    if row is not None and (row["threshold"] != threshold or row["nprobe"] != nprobe):
+        with conn:
+            conn.execute("DELETE FROM candidate_search_progress")
+            conn.execute("DELETE FROM candidate_search_params WHERE id = 1")
+        row = None
+    if row is None:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO candidate_search_params (id, threshold, nprobe) VALUES (1, ?, ?)",
+                (threshold, nprobe),
+            )
+
+
+def get_queried_video_ids(db_path: str) -> set[int]:
+    conn = get_connection(db_path)
+    rows = conn.execute("SELECT video_id FROM candidate_search_progress").fetchall()
+    return {row["video_id"] for row in rows}
+
+
+def mark_videos_queried(db_path: str, video_ids) -> None:
+    if not video_ids:
+        return
+    conn = get_connection(db_path)
+    now = time.time()
+    with conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO candidate_search_progress (video_id, queried_at) VALUES (?, ?)",
+            [(vid, now) for vid in video_ids],
+        )
+
+
+def _video_aligned_batch_bounds(query_video_ids: np.ndarray, batch_size: int) -> list[tuple[int, int]]:
+    """
+    Return (start, end) index bounds into the flat vector/id arrays such
+    that each batch holds at least batch_size frames, but a single video's
+    frames are never split across two batches. Rows must already be ordered
+    by (video_id, timestamp). This keeps "mark this video as queried"
+    accurate at the batch level — a video is only ever in one batch.
+    """
+    bounds = []
+    n = len(query_video_ids)
+    start = 0
+    while start < n:
+        end = min(start + batch_size, n)
+        while end < n and query_video_ids[end] == query_video_ids[end - 1]:
+            end += 1
+        bounds.append((start, end))
+        start = end
+    return bounds
 
 def _load_new_hashes(
     db_path: str, known_video_ids: set[int]
@@ -119,10 +186,10 @@ def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> b
     if current_count == 0:
         return False  # nothing to index yet
 
-    print(f"Building FAISS index over {current_count:,} frame hashes...")
+    _print_message('2.2', f"Building FAISS index over {current_count:,} frame hashes...")
     vectors, id_map = _load_all_hashes(db_path)
     n = len(vectors)
-    nlist = max(1, min(_DEFAULT_NLIST, int(n ** 0.5)))
+    nlist = _target_nlist(n)
     d = 64  # 64-bit pHash -> 64 binary dimensions
     quantiser = faiss.IndexBinaryFlat(d)
     index = faiss.IndexBinaryIVF(quantiser, d, nlist)
@@ -134,7 +201,7 @@ def _full_build(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> b
     faiss.write_index_binary(index, faiss_path)
     np.save(map_path, id_map)
     set_faiss_meta(db_path, n)
-    print(f"FAISS index saved ({n:,} vectors, {nlist} IVF cells).")
+    _print_message('2.2', f"FAISS index saved ({n:,} vectors, {nlist} IVF cells).")
     return True
 
 def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> bool:
@@ -165,7 +232,7 @@ def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> 
     if len(new_vectors) == 0:
         return False  # already up to date
 
-    print(f"Appending {len(new_vectors):,} new frame hashes to the FAISS index...")
+    _print_message('2.2', f"Appending {len(new_vectors):,} new frame hashes to the FAISS index...")
     start = int(id_map.shape[0]) if id_map.size else 0
     ids = np.arange(start, start + len(new_vectors), dtype=np.int64)
     index.add_with_ids(new_vectors, ids)
@@ -174,7 +241,7 @@ def update_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPROBE) -> 
     faiss.write_index_binary(index, faiss_path)
     np.save(map_path, id_map)
     set_faiss_meta(db_path, len(id_map))
-    print(f"FAISS index updated ({len(id_map):,} vectors total).")
+    _print_message('2.2', f"FAISS index updated ({len(id_map):,} vectors total).")
     return True
 
 def load_index(index_dir: str) -> tuple[faiss.IndexBinaryIVF, np.ndarray]:
@@ -196,46 +263,92 @@ def find_candidate_pairs(
     nprobe: int = 32,
     batch_size: int = 10_000,
     workers: int = 4,
-) -> set[tuple[int, int]]:
+) -> tuple[set[tuple[int, int]], bool]:
     """
     Query the FAISS index to find candidate pairs using multiple threads.
+
+    Progress is persisted incrementally: each completed batch's candidate
+    pairs are written to candidate_pairs immediately, and its videos are
+    marked as queried in candidate_search_progress. This means an
+    interrupted run resumes where it left off, and a later run with no new
+    videos skips straight past videos already searched. Press 'q' during
+    the search to stop early — anything already saved stays saved.
+
+    Returns (candidate_pairs_found_this_run, stopped_early). Pairs found in
+    earlier runs are already in the candidate_pairs table and are not
+    re-returned here — callers wanting the full set should read the table.
     """
-    _print_message('2.3.1','Loading index...')
+    conn = get_connection(db_path)
+    init_schema(db_path)  # DBs predating the progress tables lack them
+    _reset_progress_if_params_changed(conn, threshold, nprobe)
+
+    _print_message('2.3.1', 'Loading index...')
     index, id_map = load_index(index_dir)
     index.nprobe = nprobe
-    conn = get_connection(db_path)
+
+    _print_message('2.3.2', 'Retrieving videos and perceptual hashes...')
+
     all_hashes_rows = conn.execute("""
-        SELECT video_id, phash
-        FROM frame_hashes
-        ORDER BY video_id, timestamp
+        SELECT fh.video_id, fh.phash
+        FROM frame_hashes fh
+        LEFT JOIN candidate_search_progress p ON p.video_id = fh.video_id
+        WHERE p.video_id IS NULL
+        ORDER BY fh.video_id, fh.timestamp
     """).fetchall()
+
     if not all_hashes_rows:
-        return set()
-    _print_message('2.3.2','Retrieved videos and perceptual hashes...')
+        _print_message('2.3.2', 'No new videos to query — all already searched.')
+        return set(), False
+
     vectors = np.array(
         [list(_hex_to_bytes(r["phash"])) for r in all_hashes_rows], dtype=np.uint8
     )
     query_video_ids = np.array([r["video_id"] for r in all_hashes_rows], dtype=np.int64)
     k = 16  # number of nearest neighbours per query frame
-    # Prepare batch arguments
-    _print_message('2.3.3','Defining batches...')
-    batch_args = []
-    for start in range(0, len(vectors), batch_size):
-        batch = vectors[start : start + batch_size]
-        batch_vids = query_video_ids[start : start + batch_size]
-        batch_args.append((batch, batch_vids, index, id_map, k, threshold))
+
+    _print_message('2.3.3', 'Defining batches...')
+    bounds = _video_aligned_batch_bounds(query_video_ids, batch_size)
+    batch_args = [
+        (vectors[s:e], query_video_ids[s:e], index, id_map, k, threshold)
+        for s, e in bounds
+    ]
+
     candidate_pairs: set[tuple[int, int]] = set()
-    _print_message('2.3.4','Starting pair queries...')
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for batch_result in tqdm(
-            executor.map(_query_batch, batch_args),
-            total=len(batch_args),
-            desc="Querying FAISS index",
-            unit="batch",
-            dynamic_ncols=True,
-        ):
-            candidate_pairs.update(batch_result)
-    return candidate_pairs
+    stopped_early = False
+    stop_event = threading.Event()
+    quit_thread = threading.Thread(target=watch_for_quit, args=(stop_event,), daemon=True)
+    quit_thread.start()
+
+    _print_message('2.3.4', 'Starting pair queries... (press q to stop early)')
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_query_batch, arg): arg for arg in batch_args}
+            with tqdm(total=len(futures), desc="Querying FAISS index", unit="batch", dynamic_ncols=True) as bar:
+                for future in as_completed(futures):
+                    if stop_event.is_set():
+                        # Cancel queued futures — in-flight ones finish but
+                        # their results are discarded, same as Pass 2's pattern
+                        for f in futures:
+                            f.cancel()
+                        stopped_early = True
+                        break
+                    batch_pairs, batch_vids = future.result()
+                    candidate_pairs.update(batch_pairs)
+                    if batch_pairs:
+                        with conn:
+                            conn.executemany(
+                                'INSERT OR IGNORE INTO candidate_pairs (video_a_id, video_b_id) VALUES (?, ?)',
+                                list(batch_pairs),
+                            )
+                    mark_videos_queried(db_path, batch_vids)
+                    bar.update(1)
+    finally:
+        stop_event.set()  # signal quit thread to exit if search finished normally
+
+    if stopped_early:
+        _print_message('2.3.4', 'Stopped early. Progress saved — re-run to continue.')
+
+    return candidate_pairs, stopped_early
 
 def remove_videos_from_index(index_dir: str, video_ids) -> int:
     """
@@ -269,7 +382,18 @@ def remove_videos_from_index(index_dir: str, video_ids) -> int:
 
     faiss.write_index_binary(index, faiss_path)
     np.save(map_path, id_map)
-    set_faiss_meta(os.path.join(index_dir, "index.db"), int(index.ntotal))
+    db_path = os.path.join(index_dir, "index.db")
+    set_faiss_meta(db_path, int(index.ntotal))
+
+    init_schema(db_path)  # DBs predating the progress tables lack them
+    conn = get_connection(db_path)
+    placeholders = ",".join(["?"] * len(wanted))
+    with conn:
+        conn.execute(
+            f"DELETE FROM candidate_search_progress WHERE video_id IN ({placeholders})",
+            tuple(wanted),
+        )
+
     return int(n_removed)
 
 def rebuild_recommended(index, id_map) -> tuple[bool, str]:
@@ -280,7 +404,7 @@ def rebuild_recommended(index, id_map) -> tuple[bool, str]:
         return False, ""
 
     trained_nlist = int(index.nlist)
-    ideal_nlist = max(1, min(_DEFAULT_NLIST, int(live ** 0.5)))
+    ideal_nlist = _target_nlist(live)
     if ideal_nlist > trained_nlist and ideal_nlist >= _REBUILD_NLIST_GROWTH * trained_nlist:
         return True, f"IVF cells {trained_nlist} -> {ideal_nlist} for {live:,} live vectors"
 
@@ -309,5 +433,5 @@ def maybe_rebuild_index(db_path: str, index_dir: str, nprobe: int = DEFAULT_NPRO
     if not should:
         return False
 
-    print(f"Rebuilding FAISS index ({reason})...")
+    _print_message('2.2', f"Rebuilding FAISS index ({reason})...")
     return _full_build(db_path, index_dir, nprobe)
