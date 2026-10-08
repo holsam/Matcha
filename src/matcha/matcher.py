@@ -151,11 +151,15 @@ def determine_match_type(short: VideoRecord, long: VideoRecord) -> str:
     return "duplicate" if (short.duration / long.duration) >= 0.95 else "subclip"
 
 
-def _compare_pair(args: tuple) -> tuple[int, int, float]:
-    """Worker — runs the sliding window on preloaded uint64 hash arrays."""
-    short_id, long_id, short_hashes, long_hashes, frame_step, threshold = args
-    confidence = sliding_window_match_numpy(short_hashes, long_hashes, frame_step, threshold)
-    return short_id, long_id, confidence
+# _PAIR_CHUNK: pairs per thread-pool task, so task overhead stays small next to the comparisons
+_PAIR_CHUNK = 32
+
+def _compare_chunk(chunk: list[tuple]) -> list[tuple[int, int, float]]:
+    """Worker — runs the sliding window on preloaded uint64 hash arrays for a chunk of pairs."""
+    return [
+        (short_id, long_id, sliding_window_match_numpy(short_hashes, long_hashes, frame_step, threshold))
+        for short_id, long_id, short_hashes, long_hashes, frame_step, threshold in chunk
+    ]
 
 def run_match(
     directory: str,
@@ -271,8 +275,9 @@ def run_match(
     pending_matches: list[tuple[int, int, str, float]] = []
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_compare_pair, arg): arg for arg in worker_args}
-            with tqdm(total=len(futures), unit="pair", dynamic_ncols=True) as bar:
+            chunks = [worker_args[i:i + _PAIR_CHUNK] for i in range(0, len(worker_args), _PAIR_CHUNK)]
+            futures = {executor.submit(_compare_chunk, chunk): chunk for chunk in chunks}
+            with tqdm(total=len(worker_args), unit="pair", dynamic_ncols=True) as bar:
                 for future in as_completed(futures):
                     if stop_event.is_set():
                         # Cancel all queued futures — in-flight ones finish but
@@ -281,21 +286,21 @@ def run_match(
                             f.cancel()
                         stopped_early = True
                         break
-                    short_id, long_id, confidence = future.result()
-                    short = video_map[short_id]
-                    long = video_map[long_id]
-                    pending_comparisons.append((short_id, long_id))
-                    if confidence >= min_confidence:
-                        match_type = determine_match_type(short, long)
-                        pending_matches.append((short_id, long_id, match_type, confidence))
-                        matches_found += 1
-                        bar.write(
-                            f"  MATCH  {match_type:<10}  {confidence:.0%}  "
-                            f"{os.path.basename(short.path)}  ←  {os.path.basename(long.path)}"
-                        )
+                    for short_id, long_id, confidence in future.result():
+                        short = video_map[short_id]
+                        long = video_map[long_id]
+                        pending_comparisons.append((short_id, long_id))
+                        if confidence >= min_confidence:
+                            match_type = determine_match_type(short, long)
+                            pending_matches.append((short_id, long_id, match_type, confidence))
+                            matches_found += 1
+                            bar.write(
+                                f"  MATCH  {match_type:<10}  {confidence:.0%}  "
+                                f"{os.path.basename(short.path)}  ←  {os.path.basename(long.path)}"
+                            )
+                        bar.update(1)
                     if len(pending_comparisons) >= _FLUSH_EVERY:
                         _flush_results(db_path, pending_comparisons, pending_matches)
-                    bar.update(1)
     finally:
         # flush what was consumed, including on quit or error
         _flush_results(db_path, pending_comparisons, pending_matches)
