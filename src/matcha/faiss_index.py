@@ -21,7 +21,7 @@ _REBUILD_NLIST_GROWTH = 2.0
 _REBUILD_TOMBSTONE_FRACTION = 0.25
 
 def _target_nlist(n: int) -> int:
-    return max(_MIN_NLIST, int(_NLIST_MULTIPLIER * (n ** 0.5)))
+    return min(n, max(_MIN_NLIST, int(_NLIST_MULTIPLIER * (n ** 0.5))))  # FAISS needs n >= nlist
 
 def _print_message(stage: str, msg: str):
     ts = datetime.now(timezone.utc).strftime('%H:%M:%S')

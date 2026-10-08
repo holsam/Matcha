@@ -45,8 +45,10 @@ def init_schema(db_path: str):
                 phash       TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_frame_hashes_video_id
-                ON frame_hashes(video_id);
+            DROP INDEX IF EXISTS idx_frame_hashes_video_id;  -- prefix of the covering index below
+
+            CREATE INDEX IF NOT EXISTS idx_frame_hashes_video_ts
+                ON frame_hashes(video_id, timestamp, phash);
 
             CREATE TABLE IF NOT EXISTS audio_fingerprints (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,

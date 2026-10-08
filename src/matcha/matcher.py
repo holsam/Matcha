@@ -1,7 +1,8 @@
-import imagehash, itertools, os, threading, time, typer
+import itertools, os, threading, time, typer
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from numpy.lib.stride_tricks import sliding_window_view
 from datetime import datetime, timezone
 from rich import print
 from tqdm import tqdm
@@ -16,7 +17,6 @@ class VideoRecord:
     id: int
     path: str
     duration: float
-    frame_hashes: list[str]
     has_audio: bool
 
 def _print_message(stage: str, msg: str):
@@ -25,12 +25,6 @@ def _print_message(stage: str, msg: str):
     print_msg = f'({ts})'+'\t'*tab+f'{msg}'
     print(f'[dim]{print_msg}[/dim]')
 
-
-def _hex_to_uint64(hex_str: str) -> int:
-    return int(hex_str, 16)
-
-def _hamming_uint64(a: int, b: int) -> int:
-    return bin(a ^ b).count("1")
 
 def load_videos(db_path: str) -> list[VideoRecord]:
     conn = get_connection(db_path)
@@ -41,20 +35,30 @@ def load_videos(db_path: str) -> list[VideoRecord]:
     rows = conn.execute(
         "SELECT id, path, duration FROM videos WHERE fingerprinted_at IS NOT NULL"
     ).fetchall()
-    videos = []
-    for row in rows:
-        hash_rows = conn.execute(
-            "SELECT phash FROM frame_hashes WHERE video_id = ? ORDER BY timestamp",
-            (row["id"],),
-        ).fetchall()
-        videos.append(VideoRecord(
+    return [
+        VideoRecord(
             id=row["id"],
             path=row["path"],
             duration=row["duration"] or 0.0,
-            frame_hashes=[r["phash"] for r in hash_rows],
             has_audio=row["id"] in audio_ids,
-        ))
-    return videos
+        )
+        for row in rows
+    ]
+
+
+# load_hashes_for: one streaming pass over frame_hashes, returns uint64 arrays for the wanted videos only
+def load_hashes_for(db_path: str, video_ids: set[int]) -> dict[int, np.ndarray]:
+    conn = get_connection(db_path)
+    cursor = conn.execute(
+        "SELECT video_id, phash FROM frame_hashes ORDER BY video_id, timestamp"
+    )
+    hashes: dict[int, np.ndarray] = {}
+    for vid, group in itertools.groupby(cursor, key=lambda r: r["video_id"]):
+        if vid in video_ids:
+            hexes = ''.join(r["phash"] for r in group)
+            # big-endian parse equals int(hex, 16) per 16-char hash
+            hashes[vid] = np.frombuffer(bytes.fromhex(hexes), dtype='>u8').astype(np.uint64)
+    return hashes
 
 
 def load_frame_hashes(db_path: str, video_id: int) -> list[str]:
@@ -86,94 +90,60 @@ def get_compared_pairs(db_path: str) -> set[tuple[int, int]]:
     return {(row["video_a_id"], row["video_b_id"]) for row in rows}
 
 
-def record_comparison(db_path: str, id_a: int, id_b: int):
-    conn = get_connection(db_path)
-    with conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO comparisons (video_a_id, video_b_id) VALUES (?, ?)",
-            (min(id_a, id_b), max(id_a, id_b)),
-        )
+# _FLUSH_EVERY: comparisons buffered before a DB write
+_FLUSH_EVERY = 500
 
-def record_match(
+# _flush_results: write buffered comparisons and matches in one transaction
+def _flush_results(
     db_path: str,
-    short: VideoRecord,
-    long: VideoRecord,
-    match_type: str,
-    confidence: float,
-):
+    comparisons: list[tuple[int, int]],
+    matches: list[tuple[int, int, str, float]],
+) -> None:
+    if not comparisons and not matches:
+        return
     conn = get_connection(db_path)
+    now = time.time()
     with conn:
-        conn.execute(
+        conn.executemany(
+            "INSERT OR IGNORE INTO comparisons (video_a_id, video_b_id) VALUES (?, ?)",
+            [(min(a, b), max(a, b)) for a, b in comparisons],
+        )
+        conn.executemany(
             """
             INSERT INTO matches (video_a_id, video_b_id, match_type, confidence, found_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (short.id, long.id, match_type, confidence, time.time()),
+            [(a, b, t, c, now) for a, b, t, c in matches],
         )
+    comparisons.clear()
+    matches.clear()
 
-def hamming_distance(hash_a: str, hash_b: str) -> int:
-    return imagehash.hex_to_hash(hash_a) - imagehash.hex_to_hash(hash_b)
-
-def sliding_window_match(
-    short_hashes: list[str],
-    long_hashes: list[str],
-    frame_step: int,
-    threshold: int,
-) -> float:
-    n = len(short_hashes)
-    m = len(long_hashes)
-    if n == 0 or m < n:
-        return 0.0
-    best_ratio = 0.0
-    for start in range(0, m - n + 1, frame_step):
-        matches = sum(
-            1
-            for j in range(n)
-            if hamming_distance(short_hashes[j], long_hashes[start + j]) <= threshold
-        )
-        ratio = matches / n
-        if ratio > best_ratio:
-            best_ratio = ratio
-    return best_ratio
+# _WINDOW_CHUNK_ELEMS: cap on window positions x frames per XOR block (~16 MB of uint64)
+_WINDOW_CHUNK_ELEMS = 2_000_000
 
 def sliding_window_match_numpy(
-    short_hashes: list[str],
-    long_hashes: list[str],
+    short_hashes: np.ndarray,
+    long_hashes: np.ndarray,
     frame_step: int,
     threshold: int,
 ) -> float:
     """
-    Vectorised sliding window using NumPy, converts hex pHash strings to uint64 integers once, then computes Hamming distances across all window positions in batch using XOR + popcount.
+    Vectorised sliding window over uint64 pHash arrays. XOR + np.bitwise_count
+    gives Hamming distances for every window position, chunked to bound memory.
     """
     n = len(short_hashes)
     m = len(long_hashes)
     if n == 0 or m < n:
         return 0.0
-    # Convert hex strings → uint64 arrays once
-    short_ints = np.array([_hex_to_uint64(h) for h in short_hashes], dtype=np.uint64)
-    long_ints  = np.array([_hex_to_uint64(h) for h in long_hashes],  dtype=np.uint64)
-    # Precompute popcount lookup table for uint8 values (0–255)
-    popcount_table = np.zeros(256, dtype=np.uint8)
-    for i in range(256):
-        popcount_table[i] = bin(i).count("1")
-    def popcount_array(arr: np.ndarray) -> np.ndarray:
-        """Popcount each uint64 element via byte decomposition."""
-        # View as uint8 → 8 bytes per element → sum popcount per group of 8
-        as_bytes = arr.view(np.uint8).reshape(-1, 8)
-        return popcount_table[as_bytes].sum(axis=1).astype(np.int32)
-    best_ratio = 0.0
-    positions = range(0, m - n + 1, frame_step)
-    for start in positions:
-        window = long_ints[start : start + n]
-        xor = np.bitwise_xor(short_ints, window)
-        distances = popcount_array(xor)
-        match_count = int(np.sum(distances <= threshold))
-        ratio = match_count / n
-        if ratio > best_ratio:
-            best_ratio = ratio
-            if best_ratio == 1.0:
-                break  # can't improve further
-    return best_ratio
+    windows = sliding_window_view(long_hashes, n)[::frame_step]
+    chunk = max(1, _WINDOW_CHUNK_ELEMS // n)
+    best = 0
+    for start in range(0, len(windows), chunk):
+        xor = np.bitwise_xor(windows[start:start + chunk], short_hashes)
+        best = max(best, int((np.bitwise_count(xor) <= threshold).sum(axis=1).max()))
+        if best == n:
+            break  # can't improve further
+    return best / n
 
 def determine_match_type(short: VideoRecord, long: VideoRecord) -> str:
     if long.duration == 0:
@@ -182,11 +152,7 @@ def determine_match_type(short: VideoRecord, long: VideoRecord) -> str:
 
 
 def _compare_pair(args: tuple) -> tuple[int, int, float]:
-    """
-    Worker — fetches frame hashes from the DB and runs the sliding window.
-    Hash lists are not passed in; they are loaded here and discarded after,
-    keeping peak memory to one pair at a time per thread.
-    """
+    """Worker — runs the sliding window on preloaded uint64 hash arrays."""
     short_id, long_id, short_hashes, long_hashes, frame_step, threshold = args
     confidence = sliding_window_match_numpy(short_hashes, long_hashes, frame_step, threshold)
     return short_id, long_id, confidence
@@ -282,13 +248,15 @@ def run_match(
     _print_message('3.2.1', f'Pairs to verify: {len(pairs_to_run)}')
     _print_message('3.2.2', f'Already compared: {skipped}')
     _print_message('3.3.3', f'Too short to check: {len(too_short)}')
-    for short, long in too_short:
-        record_comparison(db_path, short.id, long.id)
+    _flush_results(db_path, [(short.id, long.id) for short, long in too_short], [])
     if not pairs_to_run:
         _print_message('3.3', 'No eligible pairs to verify')
         return
+    needed = {v.id for pair in pairs_to_run for v in pair}
+    _print_message('3.4', f'Loading frame hashes for {len(needed):,} video(s)...')
+    hashes = load_hashes_for(db_path, needed)
     worker_args = [
-        (s.id, l.id, s.frame_hashes, l.frame_hashes, frame_step, threshold)
+        (s.id, l.id, hashes[s.id], hashes[l.id], frame_step, threshold)
         for s, l in pairs_to_run
     ]
     if filter_length:
@@ -299,30 +267,38 @@ def run_match(
     stop_event = threading.Event()
     quit_thread = threading.Thread(target=watch_for_quit, args=(stop_event,), daemon=True)
     quit_thread.start()
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_compare_pair, arg): arg for arg in worker_args}
-        with tqdm(total=len(futures), unit="pair", dynamic_ncols=True) as bar:
-            for future in as_completed(futures):
-                if stop_event.is_set():
-                    # Cancel all queued futures — in-flight ones finish but
-                    # their results are not consumed, so they remain unrecorded
-                    for f in futures:
-                        f.cancel()
-                    stopped_early = True
-                    break
-                short_id, long_id, confidence = future.result()
-                short = video_map[short_id]
-                long = video_map[long_id]
-                record_comparison(db_path, short_id, long_id)
-                if confidence >= min_confidence:
-                    match_type = determine_match_type(short, long)
-                    record_match(db_path, short, long, match_type, confidence)
-                    matches_found += 1
-                    bar.write(
-                        f"  MATCH  {match_type:<10}  {confidence:.0%}  "
-                        f"{os.path.basename(short.path)}  ←  {os.path.basename(long.path)}"
-                    )
-                bar.update(1)
+    pending_comparisons: list[tuple[int, int]] = []
+    pending_matches: list[tuple[int, int, str, float]] = []
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_compare_pair, arg): arg for arg in worker_args}
+            with tqdm(total=len(futures), unit="pair", dynamic_ncols=True) as bar:
+                for future in as_completed(futures):
+                    if stop_event.is_set():
+                        # Cancel all queued futures — in-flight ones finish but
+                        # their results are not consumed, so they remain unrecorded
+                        for f in futures:
+                            f.cancel()
+                        stopped_early = True
+                        break
+                    short_id, long_id, confidence = future.result()
+                    short = video_map[short_id]
+                    long = video_map[long_id]
+                    pending_comparisons.append((short_id, long_id))
+                    if confidence >= min_confidence:
+                        match_type = determine_match_type(short, long)
+                        pending_matches.append((short_id, long_id, match_type, confidence))
+                        matches_found += 1
+                        bar.write(
+                            f"  MATCH  {match_type:<10}  {confidence:.0%}  "
+                            f"{os.path.basename(short.path)}  ←  {os.path.basename(long.path)}"
+                        )
+                    if len(pending_comparisons) >= _FLUSH_EVERY:
+                        _flush_results(db_path, pending_comparisons, pending_matches)
+                    bar.update(1)
+    finally:
+        # flush what was consumed, including on quit or error
+        _flush_results(db_path, pending_comparisons, pending_matches)
     stop_event.set()  # signal quit thread to exit if matching finished normally
     if stopped_early:
         typer.echo("\nStopped early. Progress has been saved — resume with `matcha match`.")
