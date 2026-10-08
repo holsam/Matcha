@@ -176,3 +176,23 @@ class TestReuseDuplicates:
         monkeypatch.setattr(indexer, "extract_frame_hashes", lambda *a, **k: calls.append(a[0]) or real(*a, **k))
         run_index(str(directory), fps=1.0, workers=1, no_audio=True, reuse_duplicates=False)
         assert len(calls) == 3
+
+
+class TestBackfillContentKeys:
+    def test_keys_existing_videos_and_enables_reuse(self, video_dir, tmp_path, monkeypatch):
+        import shutil
+        import matcha.indexer as indexer
+        src = sorted(video_dir["dir"].glob("*.mp4"))[0]
+        shutil.copy(src, tmp_path / "a.mp4")
+        run_index(str(tmp_path), fps=1.0, workers=1, no_audio=True, reuse_duplicates=False)  # no keys stored
+        db_path = str(tmp_path / ".matcha" / "index.db")
+        conn = get_connection(db_path)
+        assert conn.execute("SELECT content_key FROM videos").fetchone()[0] is None
+
+        shutil.copy(src, tmp_path / "a_copy.mp4")
+        calls = []
+        real = indexer.extract_frame_hashes
+        monkeypatch.setattr(indexer, "extract_frame_hashes", lambda *a, **k: calls.append(a[0]) or real(*a, **k))
+        run_index(str(tmp_path), fps=1.0, workers=1, no_audio=True)
+        assert calls == []  # the copy reused the backfilled original
+        assert conn.execute("SELECT COUNT(*) FROM videos WHERE content_key IS NULL").fetchone()[0] == 0

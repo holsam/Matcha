@@ -103,6 +103,24 @@ def register_videos(db_path: str, paths: list[str]):
             [(p,) for p in paths],
         )
 
+# backfill_content_keys: key already indexed videos that predate content_key; returns how many were keyed
+def backfill_content_keys(db_path: str, workers: int) -> int:
+    conn = get_connection(db_path)
+    rows = conn.execute(
+        "SELECT id, path, moved_to FROM videos WHERE content_key IS NULL AND fingerprinted_at IS NOT NULL"
+    ).fetchall()
+    if not rows:
+        return 0
+    # a moved file lives at moved_to
+    paths = [r["moved_to"] if r["moved_to"] and os.path.exists(r["moved_to"]) else r["path"] for r in rows]
+    with console.status(f"Keying {len(rows)} already indexed video(s) for duplicate reuse..."):
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            keys = list(executor.map(content_key, paths))
+    keyed = [(key, r["id"]) for key, r in zip(keys, rows) if key is not None]  # missing files stay NULL
+    with conn:
+        conn.executemany("UPDATE videos SET content_key = ? WHERE id = ?", keyed)
+    return len(keyed)
+
 def get_unprocessed(db_path: str) -> list[tuple[int, str]]:
     conn = get_connection(db_path)
     rows = conn.execute(
@@ -273,6 +291,8 @@ def run_index(
     console.print(f"Found {len(all_videos)} video(s).")
 
     register_videos(db_path, all_videos)
+    if reuse_duplicates:
+        backfill_content_keys(db_path, workers)
 
     to_process = get_unprocessed(db_path)
     console.print(f'{len(to_process)} video(s) to index.\n')
