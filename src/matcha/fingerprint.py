@@ -1,8 +1,11 @@
-import acoustid, imagehash, os, subprocess, tempfile
-from pathlib import Path
+import acoustid, imagehash, subprocess, tempfile
 from PIL import Image
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}
+
+
+# _FRAME_SIZE: (width, height) of frames piped from ffmpeg, matching the scale filter below
+_FRAME_SIZE = (160, 120)
 
 
 def extract_frame_hashes(
@@ -14,8 +17,10 @@ def extract_frame_hashes(
     Extract frames from a video at `fps` frames per second.
     Returns a list of (timestamp_seconds, phash_hex) tuples.
 
-    Frames are written to a temporary directory and deleted immediately
-    after hashing, keeping peak memory to roughly one frame at a time.
+    ffmpeg writes raw RGB frames to a pipe and each frame is hashed as it
+    arrives, so nothing touches disk and peak memory is one frame. RGB (not
+    greyscale) is piped so PIL does the greyscale conversion, which keeps
+    hashes identical to the earlier PNG-on-disk approach.
 
     If hwaccel=True, passes -hwaccel auto to ffmpeg (on Mac this uses
     VideoToolbox). Falls back silently to software decoding if unavailable.
@@ -25,35 +30,37 @@ def extract_frame_hashes(
     are unnecessary.
     """
     hashes = []
+    frame_bytes = _FRAME_SIZE[0] * _FRAME_SIZE[1] * 3
+    cmd = ["ffmpeg"]
+    if hwaccel:
+        cmd += ["-hwaccel", "auto"]
+    cmd += [
+        "-i", video_path,
+        "-vf", f"fps={fps},scale={_FRAME_SIZE[0]}:{_FRAME_SIZE[1]}",
+        "-vsync", "vfr",
+        "-pix_fmt", "rgb24",
+        "-f", "rawvideo",
+        "-loglevel", "error",
+        "pipe:1",
+    ]
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        frame_pattern = os.path.join(tmpdir, "frame_%07d.png")
-        cmd = ["ffmpeg"]
-
-        if hwaccel:
-            cmd += ["-hwaccel", "auto"]
-        cmd += [
-            "-i", video_path,
-            "-vf", f"fps={fps},scale=160:120",
-            "-vsync", "vfr",
-            "-f", "image2",
-            frame_pattern,
-            "-loglevel", "error",
-        ]
-
-        result = subprocess.run(cmd, stderr=subprocess.PIPE)
-        if result.returncode != 0:
+    # stderr goes to a file so a full pipe can never block ffmpeg while we read frames
+    with tempfile.TemporaryFile() as stderr:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr)
+        try:
+            while len(chunk := proc.stdout.read(frame_bytes)) == frame_bytes:
+                img = Image.frombytes("RGB", _FRAME_SIZE, chunk).convert("L")  # greyscale — faster and sufficient for pHash
+                hashes.append((len(hashes) / fps, str(imagehash.phash(img))))
+        finally:
+            proc.stdout.close()
+            if proc.poll() is None:
+                proc.kill()
+            returncode = proc.wait()
+        if returncode != 0:
+            stderr.seek(0)
             raise RuntimeError(
-                f"ffmpeg failed for {video_path}: {result.stderr.decode()}"
+                f"ffmpeg failed for {video_path}: {stderr.read().decode()}"
             )
-
-        frame_files = sorted(Path(tmpdir).glob("frame_*.png"))
-        for i, frame_path in enumerate(frame_files):
-            timestamp = i / fps
-            img = Image.open(frame_path).convert("L")  # greyscale — faster and sufficient for pHash
-            phash = str(imagehash.phash(img))
-            hashes.append((timestamp, phash))
-            frame_path.unlink()
 
     return hashes
 

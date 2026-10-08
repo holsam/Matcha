@@ -21,6 +21,9 @@ def get_connection(db_path: str) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, avoids an fsync per commit
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-65536")  # 64 MB page cache
         _local.conns[db_path] = conn
 
     return _local.conns[db_path]

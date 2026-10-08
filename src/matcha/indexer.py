@@ -228,7 +228,6 @@ def run_index(
     console.print(f"\n:tea: [bold green]Matcha[/bold green]")
     console.print(f"Scanning [cyan]{directory}[/cyan] for videos...")
     all_videos = find_videos(directory)
-    time.sleep(1.5)
     console.print(f"Found {len(all_videos)} video(s).")
 
     register_videos(db_path, all_videos)
