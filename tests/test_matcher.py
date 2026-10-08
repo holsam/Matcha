@@ -82,3 +82,17 @@ class TestFilterLength:
         count_unfiltered = conn.execute("SELECT COUNT(*) FROM comparisons").fetchone()[0]
 
         assert count_filtered <= count_unfiltered
+
+def test_sliding_window_matches_naive():
+    import numpy as np
+    from matcha.matcher import sliding_window_match_numpy
+    rng = np.random.default_rng(0)
+    short = rng.integers(0, 2**63, 40, dtype=np.uint64)
+    long = rng.integers(0, 2**63, 300, dtype=np.uint64)
+    long[100:140] = short ^ np.uint64(0b111)  # planted match, distance 3
+    for step in (1, 3, 7):
+        best = max(
+            sum(bin(int(a) ^ int(b)).count('1') <= 10 for a, b in zip(short, long[s:s + 40]))
+            for s in range(0, 300 - 40 + 1, step)
+        ) / 40
+        assert sliding_window_match_numpy(short, long, step, 10) == best

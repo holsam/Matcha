@@ -21,6 +21,9 @@ def get_connection(db_path: str) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, avoids an fsync per commit
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-65536")  # 64 MB page cache
         _local.conns[db_path] = conn
 
     return _local.conns[db_path]
@@ -35,7 +38,8 @@ def init_schema(db_path: str):
                 path             TEXT UNIQUE NOT NULL,
                 duration         REAL,
                 fingerprinted_at REAL,
-                moved_to         TEXT
+                moved_to         TEXT,
+                content_key      TEXT                -- size + sampled hash, for reusing hashes of identical files
             );
 
             CREATE TABLE IF NOT EXISTS frame_hashes (
@@ -45,8 +49,10 @@ def init_schema(db_path: str):
                 phash       TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_frame_hashes_video_id
-                ON frame_hashes(video_id);
+            DROP INDEX IF EXISTS idx_frame_hashes_video_id;  -- prefix of the covering index below
+
+            CREATE INDEX IF NOT EXISTS idx_frame_hashes_video_ts
+                ON frame_hashes(video_id, timestamp, phash);
 
             CREATE TABLE IF NOT EXISTS audio_fingerprints (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,6 +101,10 @@ def init_schema(db_path: str):
                 nprobe      INTEGER NOT NULL
             );
         """)
+        # databases created before content_key existed
+        if 'content_key' not in {row['name'] for row in conn.execute("PRAGMA table_info(videos)")}:
+            conn.execute("ALTER TABLE videos ADD COLUMN content_key TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_content_key ON videos(content_key)")
 
 def get_faiss_meta(db_path: str) -> dict | None:
     conn = get_connection(db_path)
