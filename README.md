@@ -22,12 +22,9 @@ Matcha provides several subcommands:
 ```sh
 matcha index    <directory>            Fingerprint all videos and populate the index
 matcha match    <directory>            Compare indexed videos and record matches
-matcha move     <directory>            Move matched videos into duplicates/ subdirectories
+matcha review   <directory>            Open a browser UI to review duplicate groups, then delete, rename or dismiss
 matcha continue [directory] [command]  Re-run the last index or match command with the same configuration
-matcha cleanup  <directory>            Reconcile the index with disk, restore lone survivors, and clean the FAISS index
 ```
-
-`move`, and `sync` all support --dry-run to preview changes before committing them. 
 
 All subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. However `continue` is provided as a utility to continue the last `index` and `match` commands, and will continue using the same parameters as previously used. 
 
@@ -46,9 +43,11 @@ For more information on using the subcommands, see the relevant section of [Subc
 - `numpy`
 - `Pillow`
 - `pyacoustid`
+- `send2trash`
+- `streamlit`
 - `tqdm`
 - `typer`
-These can be installed using: `uv add faiss-cpu imagehash numpy Pillow pyacoustid tqdm typer`.
+These can be installed using: `uv add faiss-cpu imagehash numpy Pillow pyacoustid send2trash streamlit tqdm typer`.
 
 ### Installation
 Matcha can be downloaded from this repository using: `git clone https://github.com/holsam/Matcha.git`.
@@ -140,35 +139,29 @@ A match is classified as:
 - subclip: the shorter video is <95% the duration of the longer one
 
 #### How the FAISS index is maintained
-The FAISS binary index lives at `<directory>/.matcha/frame_index.faiss`, with an ID map alongside it at `frame_index_map.npy`. It is built on the first `match` run. On later runs only the frames of newly indexed videos are appended, so the index is not rebuilt from scratch each time. `cleanup` removes the vectors of deleted videos in place. Occasionally, when the index has grown well past the size it was first trained for or has accumulated many removals, `match` rebuilds it once automatically to keep queries fast. `continue match` no longer forces a rebuild; new videos are picked up by the incremental update.
+The FAISS binary index lives at `<directory>/.matcha/frame_index.faiss`, with an ID map alongside it at `frame_index_map.npy`. It is built on the first `match` run. On later runs only the frames of newly indexed videos are appended, so the index is not rebuilt from scratch each time. Deleting a video in `review` removes its vectors in place. Occasionally, when the index has grown well past the size it was first trained for or has accumulated many removals, `match` rebuilds it once automatically to keep queries fast. `continue match` no longer forces a rebuild; new videos are picked up by the incremental update.
 
-### `matcha move`
+### `matcha review`
 #### CLI options and usage
 | Option | Default | Description |
-|--------- | --- |-------------|
-| `--dry-run` | off | Preview without moving any files |
+|--------|---------|-------------|
+| `--port` | `8501` | Port to serve the review UI on |
+
 ```sh
-# Preview what would be moved
-uv run matcha move /path/to/Videos --dry-run
-
-# Move confirmed matches
-uv run matcha move /path/to/Videos
-
-# Safe to run again — already-moved matches are skipped
-uv run matcha move /path/to/Videos
+uv run matcha review /path/to/Videos
 ```
 #### Explanation
-1. Loads all matches where `moved` = 0 from the DB
-2. Forms groups using union-find — if A matches B and A matches C, all three end up in the same group
-3. In `--dry-run` mode, prints a summary and exits without touching anything on disk
-4. Otherwise, creates `<directory>/duplicates/` and a sequentially numbered subdirectory for each group
-5. Moves each video in the group into its subdirectory, avoiding filename collisions by appending the video ID if needed
-6. Updates the path column in the videos table for every moved file
-7. Sets `moved` = 1 on all resolved match rows
+Opens a Streamlit app in the browser. Files stay where they are; nothing is moved into a `duplicates/` folder.
 
-Numbering continues from where it left off — if duplicates/1/ and duplicates/2/ already exist, the next run starts at duplicates/3/.
+- **Group list:** duplicate groups (connected components of the recorded matches, so A~B and B~C form one group), sortable by video count, best confidence or total duration, 25 per page. The list reads only the database, so it stays fast on very large libraries.
+- **Group detail:** opening a group shows each video's thumbnail, name, path, size, duration and modified date, with optional ffprobe details (resolution, codec, bitrate) and an in-page preview. A pairwise table shows the similarity and match type (`duplicate` or `subclip`) for every matched pair.
+- **Actions:** delete selected videos, keep only one video, rename a video, or dismiss the group as not duplicates. Deleting sends files to the OS trash after a confirmation, then removes the video's records and its FAISS vectors. A file that has vanished from disk is flagged and can be deleted to drop it from the index.
+- **Maintenance:** a section at the top of the list. "Scan for missing files" checks every indexed path against the disk, shows what is gone, and "Remove from index" drops those records and their FAISS vectors (it never touches files, and skips any that have reappeared). It refuses to run if the library directory is unavailable and warns when over half the files are missing, since that usually means an unmounted drive. "Restore dismissed groups" brings back every group you dismissed.
+- **Dismissed groups** are recorded on the match rows (`matches.dismissed`), so they stay hidden. Matches found by later `match` runs still appear.
 
-`matcha move` uses union-find as matches are stored as pairs, but groups can be larger. Union-find computes the transitive closure efficiently: it processes each pair in O(α(n)) time (effectively constant), so even a large match table resolves instantly.
+Thumbnails are generated on first view and cached in `.matcha/thumbs/`. Libraries organised with the old `move` command are adopted on launch: each video's `duplicates/` location becomes its path.
+
+The grouping uses union-find, which processes each pair in O(α(n)) time (effectively constant), so even a large match table resolves instantly.
 
 
 ### `matcha continue`
@@ -202,29 +195,6 @@ When continuing a `match` run, `continue` checks whether any videos have been fi
 `continue` exits with an error if no database is found (i.e. `matcha index` has never been run) or if no saved config exists for the requested command.
 
 
-### `matcha cleanup`
-#### CLI options and usage
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--dry-run` | off | Preview without changing the index, database, or files |
-
-```sh
-# Preview what would change
-uv run matcha cleanup /path/to/Videos --dry-run
-
-# Apply
-uv run matcha cleanup /path/to/Videos
-```
-#### Explanation
-`cleanup` does two jobs in one pass, then cleans the FAISS index to match.
-1. Duplicates reconciliation. Walks each numbered subdirectory inside `duplicates/` and compares the files present on disk against what the DB recorded in `moved_to`:
-    - All files still present → skip (not reviewed yet)
-    - Exactly one file remains → return it to its original `path`, clear `moved_to`, reset the match's `moved` flag, remove the DB entries for the deleted files, and remove the now-empty group directory
-    - Several deleted, several remain → remove the DB entries for the deleted files only and leave the survivors in place
-2. Global missing-file purge. Checks every remaining entry in the videos table against the filesystem. A file counts as present if its `path` exists or its `moved_to` location exists. If neither is true, the entry and all associated data (frame hashes, audio fingerprint, match and comparison records) are removed.
-
-Once the purge is decided, the matching vectors are removed from the FAISS index in place, so the index does not need rebuilding. With `--dry-run`, nothing is changed: the command reports what it would remove and return, then exits.
-
 ## Getting Help & Contributing
 If you come across any bugs/issues while using Matcha, or if you have a feature request, please open an issue [here][issues-url].
 
@@ -240,10 +210,10 @@ The SQLite database lives at `<target_dir>/.matcha/index.db`. It is created auto
 -- One row per video file
 CREATE TABLE IF NOT EXISTS videos (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    path             TEXT UNIQUE NOT NULL,   -- original absolute path (never changed)
+    path             TEXT UNIQUE NOT NULL,   -- current absolute path (updated by rename in `review`)
     duration         REAL,                   -- seconds
     fingerprinted_at REAL,                   -- unix timestamp; NULL = not yet done
-    moved_to         TEXT                    -- destination path after move; NULL = not moved
+    moved_to         TEXT                    -- legacy, unused since `move` was removed; NULL
 );
 
 -- One row per sampled frame
@@ -277,7 +247,8 @@ CREATE TABLE IF NOT EXISTS matches (
     match_type  TEXT NOT NULL,              -- 'duplicate' | 'subclip'
     confidence  REAL NOT NULL,              -- 0.0–1.0
     found_at    REAL NOT NULL,              -- unix timestamp
-    moved       INTEGER NOT NULL DEFAULT 0  -- 0 = pending, 1 = moved
+    moved       INTEGER NOT NULL DEFAULT 0, -- legacy, unused since `move` was removed
+    dismissed   INTEGER NOT NULL DEFAULT 0  -- 1 = marked not-duplicates in `review`
 );
 ```
 <br>

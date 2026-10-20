@@ -107,12 +107,15 @@ def init_schema(db_path: str):
             if col not in cols:
                 conn.execute(f"ALTER TABLE videos ADD COLUMN {col} TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_content_key ON videos(content_key)")
+        # databases created before review-ui lack the dismissed flag on matches
+        match_cols = {row['name'] for row in conn.execute("PRAGMA table_info(matches)")}
+        if 'dismissed' not in match_cols:
+            conn.execute("ALTER TABLE matches ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0")
 
 def get_faiss_meta(db_path: str) -> dict | None:
     conn = get_connection(db_path)
     row = conn.execute("SELECT * FROM faiss_index_meta WHERE id = 1").fetchone()
     return dict(row) if row else None
-
 
 def set_faiss_meta(db_path: str, vector_count: int):
     import time
@@ -124,3 +127,29 @@ def set_faiss_meta(db_path: str, vector_count: int):
             ON CONFLICT(id) DO UPDATE SET built_at = excluded.built_at,
                                           vector_count = excluded.vector_count
         """, (time.time(), vector_count))
+
+# load_all_videos: every video record as a dict with id, path, moved_to
+def load_all_videos(db_path: str) -> list[dict]:
+    conn = get_connection(db_path)
+    rows = conn.execute("SELECT id, path, moved_to FROM videos").fetchall()
+    return [{"id": r["id"], "path": r["path"], "moved_to": r["moved_to"]} for r in rows]
+
+# delete_video_record: remove a video and every row that references it
+def delete_video_record(db_path: str, video_id: int) -> None:
+    conn = get_connection(db_path)
+    with conn:
+        # child rows first, foreign_keys is ON
+        for table in ('frame_hashes', 'audio_fingerprints', 'candidate_search_progress'):
+            conn.execute(f"DELETE FROM {table} WHERE video_id = ?", (video_id,))
+        for table in ('matches', 'comparisons', 'candidate_pairs'):
+            conn.execute(f"DELETE FROM {table} WHERE video_a_id = ? OR video_b_id = ?", (video_id, video_id))
+        conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+
+# fold_in_moved_paths: adopt the legacy duplicates/ location as the real path so the review UI works in place
+def fold_in_moved_paths(db_path: str) -> int:
+    conn = get_connection(db_path)
+    with conn:
+        cur = conn.execute(
+            "UPDATE videos SET path = moved_to, moved_to = NULL WHERE moved_to IS NOT NULL"
+        )
+    return cur.rowcount
