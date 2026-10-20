@@ -83,3 +83,89 @@ class TestListView:
         with conn:
             conn.execute("DELETE FROM matches")
         assert any("No duplicate groups" in i.value for i in _run().info)
+
+
+@pytest.fixture()
+def real_library(tmp_path, monkeypatch):
+    """Three real (non-video) files forming one group: 1~2, 2~3."""
+    (tmp_path / ".matcha").mkdir()
+    db_path = str(tmp_path / ".matcha" / "index.db")
+    init_schema(db_path)
+    conn = get_connection(db_path)
+    with conn:
+        for vid in (1, 2, 3):
+            f = tmp_path / f"v{vid}.mp4"
+            f.write_text("x" * vid)
+            conn.execute("INSERT INTO videos (id, path, duration) VALUES (?, ?, 60)", (vid, str(f)))
+        conn.execute("INSERT INTO matches (video_a_id, video_b_id, match_type, confidence, found_at) VALUES (1, 2, 'duplicate', 0.95, 0)")
+        conn.execute("INSERT INTO matches (video_a_id, video_b_id, match_type, confidence, found_at) VALUES (2, 3, 'subclip', 0.85, 0)")
+    monkeypatch.setenv("MATCHA_REVIEW_DIR", str(tmp_path))
+    trashed = []
+    monkeypatch.setattr("matcha.actions.send2trash", lambda p: (trashed.append(p), __import__("os").remove(p)))
+    monkeypatch.setattr("matcha.faiss_index.remove_videos_from_index", lambda d, ids: 0)
+    return {"root": tmp_path, "conn": conn, "trashed": trashed}
+
+
+def _open(at):
+    _click(at, "Open")
+
+
+class TestDetailView:
+    def test_shows_every_video_and_pairs(self, real_library):
+        at = _run()
+        _open(at)
+        assert len(at.checkbox) == 3
+        pairs = at.dataframe[0].value
+        assert sorted(pairs["Type"]) == ["duplicate", "subclip"]
+        assert sorted(pairs["Similarity"]) == ["85%", "95%"]
+
+    def test_missing_file_flagged(self, real_library):
+        (real_library["root"] / "v3.mp4").unlink()
+        at = _run()
+        _open(at)
+        assert any("missing from disk" in w.value for w in at.warning)
+
+    def test_delete_selected_requires_confirmation(self, real_library):
+        at = _run()
+        _open(at)
+        at.checkbox(key="sel-1").check().run()
+        _click(at, "Delete selected (1)")
+        assert real_library["trashed"] == []  # nothing yet
+        assert any("1 video(s) to the trash" in w.value for w in at.warning)
+        _click(at, "Move to trash")
+        assert [p.rsplit("/", 1)[-1] for p in real_library["trashed"]] == ["v1.mp4"]
+        ids = {r[0] for r in real_library["conn"].execute("SELECT id FROM videos")}
+        assert ids == {2, 3}
+        assert len(at.checkbox) == 2  # group re-resolved, still open
+
+    def test_cancel_leaves_everything(self, real_library):
+        at = _run()
+        _open(at)
+        at.checkbox(key="sel-1").check().run()
+        _click(at, "Delete selected (1)")
+        _click(at, "Cancel")
+        assert real_library["trashed"] == []
+
+    def test_keep_only_this(self, real_library):
+        at = _run()
+        _open(at)
+        at.button(key="keep-2").click().run()
+        _click(at, "Move to trash")
+        ids = {r[0] for r in real_library["conn"].execute("SELECT id FROM videos")}
+        assert ids == {2}
+        assert at.session_state.open_group is None  # no group left, back to list
+
+    def test_rename(self, real_library):
+        at = _run()
+        _open(at)
+        at.text_input(key="name-1").set_value("fresh.mp4").run()
+        at.button(key="rename-1").click().run()
+        assert (real_library["root"] / "fresh.mp4").exists()
+        assert not (real_library["root"] / "v1.mp4").exists()
+
+    def test_dismiss_returns_to_empty_list(self, real_library):
+        at = _run()
+        _open(at)
+        _click(at, "Not duplicates, dismiss")
+        assert at.session_state.open_group is None
+        assert any("No duplicate groups" in i.value for i in at.info)

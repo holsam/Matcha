@@ -66,3 +66,21 @@ def test_fold_in_moved_paths(tmp_path):
     assert fold_in_moved_paths(db) == 1
     rows = {r["id"]: (r["path"], r["moved_to"]) for r in conn.execute("SELECT * FROM videos")}
     assert rows == {1: ("/duplicates/1/a.mp4", None), 2: ("/b.mp4", None)}
+
+
+def test_resolve_group_follows_membership(tmp_path):
+    from matcha.groups import Group, resolve_group
+    a, b = Group(1, (1, 2, 3), 0.9, False, 0), Group(10, (10, 11), 0.9, False, 0)
+    assert resolve_group([a, b], (1, 2, 3)) is a
+    assert resolve_group([a, b], (2, 3)) is a  # min id deleted, key changed
+    assert resolve_group([a, b], (99,)) is None
+    assert resolve_group([], (1,)) is None
+
+
+def test_load_pairs_and_videos(tmp_path):
+    from matcha.groups import load_pairs, load_videos
+    db = _db(tmp_path)
+    _seed(db, {1: 5, 2: 6, 3: 7}, [(1, 2, "duplicate", 0.9), (2, 3, "subclip", 0.95)])
+    assert [(p.a, p.b) for p in load_pairs(db, [1, 2, 3])] == [(2, 3), (1, 2)]  # most similar first
+    assert [(p.a, p.b) for p in load_pairs(db, [1, 2])] == [(1, 2)]
+    assert [(v.id, v.duration) for v in load_videos(db, [3, 1])] == [(1, 5), (3, 7)]

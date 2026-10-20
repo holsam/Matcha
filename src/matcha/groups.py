@@ -125,3 +125,53 @@ def matches_version(db_path: str) -> tuple[int, int, int]:
         'SELECT COALESCE(MAX(id), 0), COUNT(*), COALESCE(SUM(dismissed), 0) FROM matches'
     ).fetchone()
     return (row[0], row[1], row[2])
+
+
+# resolve_group: the current group that best overlaps the ids a user had open, or None once they are all gone
+def resolve_group(groups: list[Group], video_ids) -> Group | None:
+    wanted = set(video_ids)
+    best = max(groups, key=lambda g: len(wanted & set(g.video_ids)), default=None)
+    return best if best and wanted & set(best.video_ids) else None
+
+
+# VideoRow: the stored facts about one video
+@dataclass(frozen=True)
+class VideoRow:
+    id: int
+    path: str
+    duration: float
+
+
+# load_videos: stored rows for the given ids, in id order
+def load_videos(db_path: str, video_ids: list[int]) -> list[VideoRow]:
+    conn = get_connection(db_path)
+    marks = ','.join('?' * len(video_ids))
+    rows = conn.execute(
+        f'SELECT id, path, COALESCE(duration, 0) AS duration FROM videos WHERE id IN ({marks}) ORDER BY id',
+        list(video_ids),
+    ).fetchall()
+    return [VideoRow(r['id'], r['path'], r['duration']) for r in rows]
+
+
+# Pair: one recorded match between two videos
+@dataclass(frozen=True)
+class Pair:
+    a: int
+    b: int
+    match_type: str
+    confidence: float
+
+
+# load_pairs: undismissed matches whose two videos are both in the given ids, most similar first
+def load_pairs(db_path: str, video_ids: list[int]) -> list[Pair]:
+    conn = get_connection(db_path)
+    marks = ','.join('?' * len(video_ids))
+    rows = conn.execute(
+        f'''
+        SELECT video_a_id, video_b_id, match_type, confidence FROM matches
+        WHERE dismissed = 0 AND video_a_id IN ({marks}) AND video_b_id IN ({marks})
+        ORDER BY confidence DESC, id
+        ''',
+        [*video_ids, *video_ids],
+    ).fetchall()
+    return [Pair(r['video_a_id'], r['video_b_id'], r['match_type'], r['confidence']) for r in rows]
