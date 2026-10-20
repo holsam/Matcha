@@ -1,6 +1,6 @@
 import os, shutil, typer
 
-from .db import get_connection
+from .db import delete_video_record, get_connection, load_all_videos
 
 def get_group_records(db_path: str, group_dir: str) -> list[dict]:
     """All video records whose moved_to path is inside group_dir."""
@@ -10,24 +10,6 @@ def get_group_records(db_path: str, group_dir: str) -> list[dict]:
         (group_dir.rstrip("/") + "/%",),
     ).fetchall()
     return [{"id": r["id"], "path": r["path"], "moved_to": r["moved_to"]} for r in rows]
-
-
-def load_all_videos(db_path: str) -> list[dict]:
-    """Every video record as a dict with id, path, moved_to."""
-    conn = get_connection(db_path)
-    rows = conn.execute("SELECT id, path, moved_to FROM videos").fetchall()
-    return [{"id": r["id"], "path": r["path"], "moved_to": r["moved_to"]} for r in rows]
-
-
-def delete_video_record(db_path: str, video_id: int):
-    """Remove a video and all associated data from the DB."""
-    conn = get_connection(db_path)
-    with conn:
-        conn.execute("DELETE FROM frame_hashes WHERE video_id = ?", (video_id,))
-        conn.execute("DELETE FROM audio_fingerprints WHERE video_id = ?", (video_id,))
-        conn.execute("DELETE FROM matches WHERE video_a_id = ? OR video_b_id = ?", (video_id, video_id))
-        conn.execute("DELETE FROM comparisons WHERE video_a_id = ? OR video_b_id = ?", (video_id, video_id))
-        conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
 
 
 def clear_moved_to(db_path: str, video_id: int):

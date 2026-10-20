@@ -1,29 +1,6 @@
 import os, typer
 
-from .db import get_connection
-
-def load_all_videos(db_path: str) -> list[dict]:
-    """Return all video records as dicts with id, path, moved_to."""
-    conn = get_connection(db_path)
-    rows = conn.execute("SELECT id, path, moved_to FROM videos").fetchall()
-    return [{"id": row["id"], "path": row["path"], "moved_to": row["moved_to"]} for row in rows]
-
-
-def delete_video_record(db_path: str, video_id: int):
-    """Remove a video and all associated data from the DB."""
-    conn = get_connection(db_path)
-    with conn:
-        conn.execute("DELETE FROM frame_hashes WHERE video_id = ?", (video_id,))
-        conn.execute("DELETE FROM audio_fingerprints WHERE video_id = ?", (video_id,))
-        conn.execute(
-            "DELETE FROM matches WHERE video_a_id = ? OR video_b_id = ?",
-            (video_id, video_id),
-        )
-        conn.execute(
-            "DELETE FROM comparisons WHERE video_a_id = ? OR video_b_id = ?",
-            (video_id, video_id),
-        )
-        conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+from .db import delete_video_record, get_connection, load_all_videos
 
 
 def run_sync(directory: str, dry_run: bool = False):

@@ -124,3 +124,19 @@ def set_faiss_meta(db_path: str, vector_count: int):
             ON CONFLICT(id) DO UPDATE SET built_at = excluded.built_at,
                                           vector_count = excluded.vector_count
         """, (time.time(), vector_count))
+# load_all_videos: every video record as a dict with id, path, moved_to
+def load_all_videos(db_path: str) -> list[dict]:
+    conn = get_connection(db_path)
+    rows = conn.execute("SELECT id, path, moved_to FROM videos").fetchall()
+    return [{"id": r["id"], "path": r["path"], "moved_to": r["moved_to"]} for r in rows]
+
+# delete_video_record: remove a video and every row that references it
+def delete_video_record(db_path: str, video_id: int) -> None:
+    conn = get_connection(db_path)
+    with conn:
+        # child rows first, foreign_keys is ON
+        for table in ('frame_hashes', 'audio_fingerprints', 'candidate_search_progress'):
+            conn.execute(f"DELETE FROM {table} WHERE video_id = ?", (video_id,))
+        for table in ('matches', 'comparisons', 'candidate_pairs'):
+            conn.execute(f"DELETE FROM {table} WHERE video_a_id = ? OR video_b_id = ?", (video_id, video_id))
+        conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
