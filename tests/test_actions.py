@@ -101,3 +101,52 @@ class TestDismiss:
     def test_marks_group_matches(self, lib):
         assert actions.dismiss_group(lib["dir"], [1, 2, 3]) == 2
         assert lib["conn"].execute("SELECT COUNT(*) FROM matches WHERE dismissed = 0").fetchone()[0] == 0
+
+
+class TestMaintenance:
+    def test_find_missing(self, lib):
+        (lib["root"] / "v2.mp4").unlink()
+        seen = []
+        res = actions.find_missing(lib["dir"], progress=lambda d, t: seen.append((d, t)))
+        assert res.total == 3 and [m.id for m in res.missing] == [2]
+        assert seen[-1] == (3, 3)
+
+    def test_find_missing_refuses_unavailable_library(self, lib, tmp_path):
+        import shutil
+        shutil.rmtree(lib["root"])
+        with pytest.raises(FileNotFoundError):
+            actions.find_missing(lib["dir"])
+
+    def test_purge_missing_skips_reappeared_and_never_trashes(self, lib):
+        (lib["root"] / "v1.mp4").unlink()
+        (lib["root"] / "v2.mp4").unlink()
+        (lib["root"] / "v2.mp4").write_text("x")  # back on disk after the scan
+        assert actions.purge_missing(lib["dir"], [1, 2]) == [1]
+        assert _ids(lib) == {2, 3}
+        assert lib["trashed"] == [] and lib["removed"] == [[1]]
+
+    def test_restore_dismissed(self, lib):
+        actions.dismiss_group(lib["dir"], [1, 2, 3])
+        assert actions.restore_dismissed(lib["dir"]) == 2
+        assert lib["conn"].execute("SELECT COUNT(*) FROM matches WHERE dismissed = 1").fetchone()[0] == 0
+
+    def test_find_missing_across_folders_and_gone_folder(self, lib):
+        import shutil
+        sub = lib["root"] / "sub"
+        sub.mkdir()
+        gone = lib["root"] / "gone"
+        gone.mkdir()
+        lib["conn"].execute("INSERT INTO videos (id, path, duration) VALUES (4, ?, 1)", (str(sub / "a.mp4"),))
+        lib["conn"].execute("INSERT INTO videos (id, path, duration) VALUES (5, ?, 1)", (str(gone / "b.mp4"),))
+        lib["conn"].commit()
+        (sub / "a.mp4").write_text("x")
+        (lib["root"] / "v3.mp4").unlink()
+        gone.rmdir()
+        res = actions.find_missing(lib["dir"])
+        assert res.total == 5 and [m.id for m in res.missing] == [3, 5]
+
+    def test_find_missing_unreadable_folder_falls_back_to_stat(self, lib, monkeypatch):
+        import os
+        monkeypatch.setattr(os, "scandir", lambda p: (_ for _ in ()).throw(PermissionError()))
+        (lib["root"] / "v2.mp4").unlink()
+        assert [m.id for m in actions.find_missing(lib["dir"]).missing] == [2]

@@ -169,3 +169,33 @@ class TestDetailView:
         _click(at, "Not duplicates, dismiss")
         assert at.session_state.open_group is None
         assert any("No duplicate groups" in i.value for i in at.info)
+
+
+class TestMaintenance:
+    def test_scan_and_purge_missing(self, real_library):
+        (real_library["root"] / "v3.mp4").unlink()
+        at = _run()
+        _click(at, "Scan for missing files")
+        assert any("1 of 3" in w.value for w in at.warning)
+        _click(at, "Remove 1 from index")
+        assert {r[0] for r in real_library["conn"].execute("SELECT id FROM videos")} == {1, 2}
+        assert real_library["trashed"] == []
+
+    def test_scan_clean_library(self, real_library):
+        at = _run()
+        _click(at, "Scan for missing files")
+        assert any("All 3 indexed files" in s.value for s in at.success)
+
+    def test_mostly_missing_warns_about_mount(self, real_library):
+        for n in (1, 2):
+            (real_library["root"] / f"v{n}.mp4").unlink()
+        at = _run()
+        _click(at, "Scan for missing files")
+        assert any("drive is mounted" in e.value for e in at.error)
+
+    def test_restore_dismissed(self, real_library):
+        at = _run()
+        _open(at)
+        _click(at, "Not duplicates, dismiss")
+        _click(at, "Restore dismissed groups (2 matches)")
+        assert len([b for b in at.button if b.label == "Open"]) == 1

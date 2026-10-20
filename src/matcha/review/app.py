@@ -9,7 +9,7 @@ from datetime import datetime
 
 # Import internal matcha objects
 from matcha import actions
-from matcha.db import init_schema
+from matcha.db import get_connection, init_schema
 from matcha.groups import (
     SORTS, Group, VideoRow, find_groups, load_pairs, load_videos, matches_version,
     paginate, resolve_group, sort_groups, video_names,
@@ -45,10 +45,46 @@ def _card(db_path: str, group: Group) -> None:
                 st.rerun()
 
 
+# _maintenance: reconcile the index with the disk and undo dismissals, all on demand
+def _maintenance(db_path: str) -> None:
+    scan: actions.ScanResult | None = st.session_state.get('scan')
+    with st.expander('Maintenance', expanded=scan is not None):
+        st.caption('Files deleted or moved outside Matcha stay in the index until you reconcile it. Scanning checks every indexed path, which can be slow on a large disk.')
+        if st.button('Scan for missing files'):
+            bar = st.progress(0.0, text='Checking files...')
+            try:
+                st.session_state.scan = actions.find_missing(
+                    _library(), progress=lambda done, total: bar.progress(done / total, text=f'Checked {done:,} of {total:,}')
+                )
+            except FileNotFoundError as exc:
+                _flash('error', str(exc))
+            st.rerun()
+        if scan is not None:
+            if not scan.missing:
+                st.success(f'All {scan.total:,} indexed files are on disk.')
+            else:
+                share = len(scan.missing) / scan.total
+                st.warning(f'{len(scan.missing):,} of {scan.total:,} indexed files ({share:.0%}) are missing from disk.')
+                if share > 0.5:
+                    st.error('Most files are missing. Check that the drive is mounted before removing anything.')
+                st.code('\n'.join(m.path for m in scan.missing[:20]) + (f'\n... and {len(scan.missing) - 20:,} more' if len(scan.missing) > 20 else ''))
+                if st.button(f'Remove {len(scan.missing):,} from index', type='primary'):
+                    purged = actions.purge_missing(_library(), [m.id for m in scan.missing])
+                    _flash('ok', f'Removed {len(purged):,} missing file(s) from the index.')
+                    st.session_state.scan = None
+                    st.rerun()
+        dismissed = get_connection(db_path).execute('SELECT COUNT(*) FROM matches WHERE dismissed = 1').fetchone()[0]
+        if dismissed and st.button(f'Restore dismissed groups ({dismissed:,} matches)'):
+            actions.restore_dismissed(_library())
+            _flash('ok', 'Dismissed groups restored.')
+            st.rerun()
+
+
 # _list_view: sortable, paginated group list
 def _list_view(db_path: str) -> None:
     groups = _load_groups(db_path, matches_version(db_path))
     st.title('Matcha review')
+    _maintenance(db_path)
     if not groups:
         st.info('No duplicate groups to review.')
         return
