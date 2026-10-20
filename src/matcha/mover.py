@@ -1,35 +1,7 @@
 import os, shutil, typer
-from collections import defaultdict
 
 from .db import get_connection
-
-class UnionFind:
-    def __init__(self):
-        self._parent: dict[int, int] = {}
-
-    def _ensure(self, x: int):
-        if x not in self._parent:
-            self._parent[x] = x
-
-    def find(self, x: int) -> int:
-        self._ensure(x)
-        if self._parent[x] != x:
-            self._parent[x] = self.find(self._parent[x])
-        return self._parent[x]
-
-    def union(self, x: int, y: int):
-        self._ensure(x)
-        self._ensure(y)
-        rx, ry = self.find(x), self.find(y)
-        if rx != ry:
-            self._parent[ry] = rx
-
-    def groups(self) -> list[set[int]]:
-        buckets: dict[int, set[int]] = defaultdict(set)
-        for x in self._parent:
-            buckets[self.find(x)].add(x)
-        return list(buckets.values())
-
+from .groups import build_groups
 
 def load_unresolved_matches(db_path: str) -> list[tuple[int, int]]:
     conn = get_connection(db_path)
@@ -70,13 +42,6 @@ def record_moved_to(db_path: str, video_id: int, moved_to: str):
             "UPDATE videos SET moved_to = ? WHERE id = ?",
             (moved_to, video_id),
         )
-
-
-def build_groups(matches: list[tuple[int, int]]) -> list[set[int]]:
-    uf = UnionFind()
-    for a, b in matches:
-        uf.union(a, b)
-    return uf.groups()
 
 
 def run_move(directory: str, dry_run: bool = False):
