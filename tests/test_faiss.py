@@ -19,6 +19,7 @@ from matcha.faiss_index import (
     maybe_rebuild_index,
     load_index,
     _load_new_hashes,
+    _target_nlist,
 )
 
 
@@ -216,7 +217,7 @@ class TestRebuildDecision:
         return np.column_stack([col0, np.zeros(total, dtype=np.int64)])
 
     def test_healthy_index_not_rebuilt(self):
-        idx = types.SimpleNamespace(ntotal=100, nlist=10)
+        idx = types.SimpleNamespace(ntotal=100, nlist=_target_nlist(100))
         should, _ = rebuild_recommended(idx, self._idmap(100, 100))
         assert should is False
 
@@ -254,17 +255,17 @@ class TestMaybeRebuild:
 
     def test_nlist_drift_rebuilds(self, tmp_path):
         b = _Builder(tmp_path)
-        b.add_video(1, 16)                 # trained nlist = 4
+        b.add_video(1, 16)                 # trained nlist = _target_nlist(16)
         update_index(b.db_path, b.index_dir)
         idx, _ = load_index(b.index_dir)
-        assert idx.nlist == 4
+        assert idx.nlist == _target_nlist(16)
 
         b.add_video(2, 84)                 # grow to 100 live vectors
         update_index(b.db_path, b.index_dir)
 
         assert maybe_rebuild_index(b.db_path, b.index_dir) is True
         idx, id_map = load_index(b.index_dir)
-        assert idx.nlist == 10             # retrained for the new size
+        assert idx.nlist == _target_nlist(100)  # retrained for the new size
         assert idx.ntotal == 100
         assert int((id_map[:, 0] == -1).sum()) == 0
 
