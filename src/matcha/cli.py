@@ -1,12 +1,10 @@
 import os, subprocess, sys
 import typer
 
-from matcha.cleanup import run_cleanup
 from matcha.continuer import run_continue
 from matcha.db import fold_in_moved_paths, init_schema
 from matcha.indexer import run_index
 from matcha.matcher import run_match
-from matcha.mover import run_move
 
 app = typer.Typer(help="Matcha — a video matching tool using perceptual hashing.")
 
@@ -47,29 +45,6 @@ def match(
         nprobe=nprobe
     )
 
-
-@app.command()
-def move(
-    directory: str = typer.Argument(..., help="Directory to organise."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without moving any files."),
-):
-    """Move matched videos into sequentially numbered subdirectories under duplicates/."""
-    run_move(directory, dry_run=dry_run)
-
-@app.command()
-def cleanup(
-    directory: str = typer.Argument(..., help="Directory to clean up."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without changing the index, database, or files."),
-):
-    """
-    Reconcile the index with what is on disk.
-
-    Removes index entries for any file that no longer exists, including those
-    deleted from duplicates/. When a single file survives a duplicates group it
-    is returned to its original location. Matching vectors are removed from the
-    FAISS index in place.
-    """
-    run_cleanup(directory, dry_run=dry_run)
 
 
 @app.command()

@@ -5,13 +5,15 @@ File | What it covers
 ------|---------------
 `test_indexer.py` | DB creation, video registration, frame hashing, duration storage, idempotency of repeated indexing
 `test_matcher.py` | Exact match detection, subclip detection, false-positive rejection, match checkpointing, `--filter-length` behaviour
-`test_mover.py` | Dry-run output, file movement, group directory assignment, DB path updates, `moved` flag, sequential numbering
+`test_groups.py` | Union-find grouping, group summaries and ordering, dismissed matches, schema migration, legacy `moved_to` fold-in, pair and video loading
 `test_continuer.py` | Config saving and loading, atomic writes, staleness detection, FAISS invalidation, `run_continue` dispatch, prompting behaviour
 `test_faiss.py` | Incremental build, idempotent no-op, append on new videos, in-place vector removal and tombstoning, no ID collision after remove + append
-`test_cleanup.py` | Duplicates reconciliation, lone-survivor return, global missing-file purge (formerly `sync`), dry-run, FAISS vector removal
+`test_actions.py` | Delete (trash, record purge, batched FAISS removal), keep-one, rename validation, dismiss
+`test_media.py` | File stat, ffprobe, thumbnail generation and caching, graceful failure on unreadable files
+`test_review_app.py` | Review UI list paging and sorting, group detail view, confirmation flow, rename, dismiss (Streamlit `AppTest`)
 
 ## Running tests
-`test_indexer.py`, `test_matcher.py`, `test_mover.py` and `test_continuer.py` require test videos which sould be generated before the session using `generate_test_videos.py` then reused across all tests. `test_faiss.py` and `test_cleanup.py` use small synthetic databases and dummy files rather than the generated videos, so they run quickly and in isolation.
+`test_indexer.py`, `test_matcher.py` and `test_continuer.py` require test videos which sould be generated before the session using `generate_test_videos.py` then reused across all tests. `test_faiss.py`, `test_groups.py`, `test_actions.py` and `test_review_app.py` use small synthetic databases and dummy files rather than the generated videos, so they run quickly and in isolation.
 
 ```bash
 # Generate test videos
