@@ -87,3 +87,41 @@ def find_groups(db_path: str) -> list[Group]:
     ]
     groups.sort(key=lambda g: (-len(g.video_ids), -g.max_confidence, g.key))
     return groups
+
+
+# SORTS: sort key name to (label, key function, reverse)
+SORTS = {
+    'size': ('Most videos', lambda g: (len(g.video_ids), g.max_confidence), True),
+    'confidence': ('Highest confidence', lambda g: (g.max_confidence, len(g.video_ids)), True),
+    'duration': ('Longest total duration', lambda g: g.total_duration, True),
+}
+
+
+# sort_groups: reorder groups by one of the SORTS keys, ties broken by group key for a stable order
+def sort_groups(groups: list[Group], sort: str) -> list[Group]:
+    _, key, reverse = SORTS[sort]
+    return sorted(sorted(groups, key=lambda g: g.key), key=key, reverse=reverse)
+
+
+# paginate: one page of items plus the page count (always at least 1), page clamped into range
+def paginate[T](items: list[T], page: int, per_page: int) -> tuple[list[T], int, int]:
+    pages = max(1, -(-len(items) // per_page))
+    page = min(max(page, 0), pages - 1)
+    return items[page * per_page:(page + 1) * per_page], page, pages
+
+
+# video_names: file names for the given ids, used to label group cards without touching the disk
+def video_names(db_path: str, video_ids: list[int]) -> dict[int, str]:
+    conn = get_connection(db_path)
+    marks = ','.join('?' * len(video_ids))
+    rows = conn.execute(f'SELECT id, path FROM videos WHERE id IN ({marks})', video_ids).fetchall()
+    return {r['id']: r['path'].rsplit('/', 1)[-1] for r in rows}
+
+
+# matches_version: cheap token that changes whenever the set of visible matches changes, for cache keys
+def matches_version(db_path: str) -> tuple[int, int, int]:
+    conn = get_connection(db_path)
+    row = conn.execute(
+        'SELECT COALESCE(MAX(id), 0), COUNT(*), COALESCE(SUM(dismissed), 0) FROM matches'
+    ).fetchone()
+    return (row[0], row[1], row[2])

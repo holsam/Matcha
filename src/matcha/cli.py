@@ -1,7 +1,9 @@
+import os, subprocess, sys
 import typer
 
 from matcha.cleanup import run_cleanup
 from matcha.continuer import run_continue
+from matcha.db import fold_in_moved_paths, init_schema
 from matcha.indexer import run_index
 from matcha.matcher import run_match
 from matcha.mover import run_move
@@ -68,6 +70,29 @@ def cleanup(
     FAISS index in place.
     """
     run_cleanup(directory, dry_run=dry_run)
+
+
+@app.command()
+def review(
+    directory: str = typer.Argument(..., help="Directory to review."),
+    port: int = typer.Option(8501, help="Port to serve the review UI on."),
+):
+    """Open the browser UI to review duplicate groups and delete, rename or dismiss videos."""
+    directory = os.path.abspath(directory)
+    db_path = os.path.join(directory, ".matcha", "index.db")
+    if not os.path.exists(db_path):
+        typer.echo("No index found. Run `matcha index` first.")
+        raise SystemExit(1)
+    init_schema(db_path)
+    folded = fold_in_moved_paths(db_path)  # videos from the old `move` command are reviewed where they now sit
+    if folded:
+        typer.echo(f"Adopted the duplicates/ location for {folded} previously moved video(s).")
+    app_path = os.path.join(os.path.dirname(__file__), "review", "app.py")
+    subprocess.run(
+        [sys.executable, "-m", "streamlit", "run", app_path, "--server.port", str(port)],
+        env={**os.environ, "MATCHA_REVIEW_DIR": directory},
+        check=False,
+    )
 
 
 @app.command()
