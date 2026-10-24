@@ -319,6 +319,8 @@ def find_candidate_pairs(
     ]
 
     candidate_pairs: set[tuple[int, int]] = set()
+    # index may hold vectors for videos since deleted from the DB; drop their pairs
+    live_ids = {r[0] for r in conn.execute('SELECT id FROM videos')}
     stopped_early = False
     stop_event = threading.Event()
     quit_thread = threading.Thread(target=watch_for_quit, args=(stop_event,), daemon=True)
@@ -338,6 +340,7 @@ def find_candidate_pairs(
                         stopped_early = True
                         break
                     batch_pairs, batch_vids = future.result()
+                    batch_pairs = {p for p in batch_pairs if p[0] in live_ids and p[1] in live_ids}
                     candidate_pairs.update(batch_pairs)
                     if batch_pairs:
                         with conn:
