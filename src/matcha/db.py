@@ -98,7 +98,8 @@ def init_schema(db_path: str):
             CREATE TABLE IF NOT EXISTS candidate_search_params (
                 id          INTEGER PRIMARY KEY CHECK (id = 1),  -- enforce single row
                 threshold   INTEGER NOT NULL,
-                nprobe      INTEGER NOT NULL
+                nprobe      INTEGER NOT NULL,
+                min_votes   INTEGER NOT NULL DEFAULT 1
             );
         """)
         # databases created before these columns existed (moved_to: <1.5.3, content_key: <2.1)
@@ -107,6 +108,14 @@ def init_schema(db_path: str):
             if col not in cols:
                 conn.execute(f"ALTER TABLE videos ADD COLUMN {col} TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_content_key ON videos(content_key)")
+        # the composite primary keys only cover video_a_id, so without these every video delete (and its foreign key check) scans the whole table
+        for table in ('comparisons', 'candidate_pairs', 'matches'):
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_b ON {table}(video_b_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_matches_a ON matches(video_a_id)")
+        # databases created before the offset-vote filter lack min_votes (1 = no filtering, the old behaviour)
+        param_cols = {row['name'] for row in conn.execute("PRAGMA table_info(candidate_search_params)")}
+        if 'min_votes' not in param_cols:
+            conn.execute("ALTER TABLE candidate_search_params ADD COLUMN min_votes INTEGER NOT NULL DEFAULT 1")
         # databases created before review-ui lack the dismissed flag on matches
         match_cols = {row['name'] for row in conn.execute("PRAGMA table_info(matches)")}
         if 'dismissed' not in match_cols:

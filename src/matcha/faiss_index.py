@@ -69,9 +69,22 @@ def _load_all_hashes(db_path: str) -> tuple[np.ndarray, np.ndarray]:
     video_ids, vectors = _split_rows(rows)
     return vectors, _build_id_map(video_ids)
 
+# _pairs_with_votes: packed pairs where at least min_votes distinct frames agree on one offset between the two videos
+def _pairs_with_votes(packed: np.ndarray, offsets: np.ndarray, lo_frames: np.ndarray, min_votes: int) -> np.ndarray:
+    if len(packed) == 0:
+        return packed
+    order = np.lexsort((lo_frames, offsets, packed))
+    p, o, f = packed[order], offsets[order], lo_frames[order]
+    # a hit seen from both videos has the same (pair, offset, lo frame), so it votes once
+    distinct = np.r_[True, (p[1:] != p[:-1]) | (o[1:] != o[:-1]) | (f[1:] != f[:-1])]
+    p, o = p[distinct], o[distinct]
+    run_start = np.flatnonzero(np.r_[True, (p[1:] != p[:-1]) | (o[1:] != o[:-1])])
+    votes = np.diff(np.r_[run_start, len(p)])
+    return np.unique(p[run_start[votes >= min_votes]])
+
 def _query_batch(args: tuple) -> tuple[set[tuple[int, int]], set[int]]:
     """Process a single batch of queries. Returns (candidate pairs, video_ids covered) for this batch."""
-    batch, batch_vids, index, id_map, k, threshold = args
+    batch, batch_vids, batch_frames, index, id_map, k, threshold, min_votes = args
     # identical hashes return identical neighbours (static scenes, black frames), so search each distinct hash once
     keys = np.ascontiguousarray(batch).view(np.uint64).ravel()
     _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
@@ -79,12 +92,22 @@ def _query_batch(args: tuple) -> tuple[set[tuple[int, int]], set[int]]:
     distances, labels = distances[inverse], labels[inverse]
     valid = (labels >= 0) & (distances <= threshold)
     query_vids = np.broadcast_to(batch_vids[:, None], labels.shape)[valid]
-    candidate_vids = id_map[labels[valid], 0]
-    keep = (candidate_vids >= 0) & (candidate_vids != query_vids)  # drop tombstoned and same-video hits
-    lo = np.minimum(query_vids[keep], candidate_vids[keep])
-    hi = np.maximum(query_vids[keep], candidate_vids[keep])
+    query_frames = np.broadcast_to(batch_frames[:, None], labels.shape)[valid]
+    hit_rows = id_map[labels[valid]]
+    keep = (hit_rows[:, 0] >= 0) & (hit_rows[:, 0] != query_vids)  # drop tombstoned and same-video hits
+    query_vids, query_frames, hit_rows = query_vids[keep], query_frames[keep], hit_rows[keep]
+    candidate_vids, candidate_frames = hit_rows[:, 0], hit_rows[:, 1]
+    lo = np.minimum(query_vids, candidate_vids)
+    hi = np.maximum(query_vids, candidate_vids)
     # pack each pair into one int so np.unique dedupes it; video ids fit in 32 bits
-    packed = np.unique((lo << 32) | hi)
+    packed = (lo << 32) | hi
+    if min_votes > 1:
+        # a real shared clip lines up at one offset over many frames, coincidental hits (black frames, static scenes) scatter
+        query_is_lo = query_vids < candidate_vids
+        lo_frames = np.where(query_is_lo, query_frames, candidate_frames)
+        offsets = np.where(query_is_lo, candidate_frames, query_frames) - lo_frames
+        packed = _pairs_with_votes(packed, offsets, lo_frames, min_votes)
+    packed = np.unique(packed)
     pairs = set(zip((packed >> 32).tolist(), (packed & 0xFFFFFFFF).tolist()))
     return pairs, set(np.unique(batch_vids).tolist())
 
@@ -95,26 +118,32 @@ def _index_paths(index_dir: str) -> tuple[str, str]:
         os.path.join(index_dir, "frame_index_map.npy"),
     )
 
-def _reset_progress_if_params_changed(conn, threshold: int, nprobe: int):
+def _reset_progress_if_params_changed(conn, threshold: int, nprobe: int, min_votes: int):
     """
-    Candidate-search progress is only valid for the threshold/nprobe it was
-    recorded under — both affect which neighbours pass the filter. If either
-    has changed since the last run, drop all progress so every video gets
-    re-queried under the new parameters.
+    Candidate-search progress is only valid for the threshold/nprobe/min_votes
+    it was recorded under — all three affect which pairs are emitted. If any
+    has changed since the last run, drop all progress and the stored
+    candidate pairs (which were generated under the old settings) so every
+    video gets re-queried under the new parameters. Finished comparisons are
+    kept, so nothing already compared is compared again.
     """
     row = conn.execute(
-        "SELECT threshold, nprobe FROM candidate_search_params WHERE id = 1"
+        "SELECT threshold, nprobe, min_votes FROM candidate_search_params WHERE id = 1"
     ).fetchone()
-    if row is not None and (row["threshold"] != threshold or row["nprobe"] != nprobe):
+    if row is not None and (
+        row["threshold"] != threshold or row["nprobe"] != nprobe or row["min_votes"] != min_votes
+    ):
+        _print_message('2.3.1', 'Search settings changed since the last run: clearing stored candidate pairs and progress.')
         with conn:
             conn.execute("DELETE FROM candidate_search_progress")
+            conn.execute("DELETE FROM candidate_pairs")
             conn.execute("DELETE FROM candidate_search_params WHERE id = 1")
         row = None
     if row is None:
         with conn:
             conn.execute(
-                "INSERT OR REPLACE INTO candidate_search_params (id, threshold, nprobe) VALUES (1, ?, ?)",
-                (threshold, nprobe),
+                "INSERT OR REPLACE INTO candidate_search_params (id, threshold, nprobe, min_votes) VALUES (1, ?, ?, ?)",
+                (threshold, nprobe, min_votes),
             )
 
 
@@ -271,9 +300,14 @@ def find_candidate_pairs(
     nprobe: int = 32,
     batch_size: int = 10_000,
     workers: int = 4,
+    min_votes: int = 2,
 ) -> tuple[set[tuple[int, int]], bool]:
     """
     Query the FAISS index to find candidate pairs using multiple threads.
+
+    A pair is only emitted when at least min_votes distinct frames agree on
+    one offset between the two videos (min_votes=1 keeps every near-identical
+    frame hit).
 
     Progress is persisted incrementally: each completed batch's candidate
     pairs are written to candidate_pairs immediately, and its videos are
@@ -288,7 +322,7 @@ def find_candidate_pairs(
     """
     conn = get_connection(db_path)
     init_schema(db_path)  # DBs predating the progress tables lack them
-    _reset_progress_if_params_changed(conn, threshold, nprobe)
+    _reset_progress_if_params_changed(conn, threshold, nprobe, min_votes)
 
     _print_message('2.3.1', 'Loading index...')
     index, id_map = load_index(index_dir)
@@ -309,12 +343,13 @@ def find_candidate_pairs(
         return set(), False
 
     query_video_ids, vectors = _split_rows(all_hashes_rows)
+    query_frames = _build_id_map(query_video_ids)[:, 1]  # frame number within each video, as in the index's id map
     k = 16  # number of nearest neighbours per query frame
 
     _print_message('2.3.3', 'Defining batches...')
     bounds = _video_aligned_batch_bounds(query_video_ids, batch_size)
     batch_args = [
-        (vectors[s:e], query_video_ids[s:e], index, id_map, k, threshold)
+        (vectors[s:e], query_video_ids[s:e], query_frames[s:e], index, id_map, k, threshold, min_votes)
         for s, e in bounds
     ]
 

@@ -9,9 +9,10 @@ def watch_for_quit(stop_event: threading.Event):
     '''
     Background thread that sets stop_event when 'q' is pressed.
 
-    Puts stdin into raw (unbuffered, no-echo) mode so keypresses are
-    received immediately without the user pressing Enter. Restores the
-    original terminal settings on exit regardless of how it ends.
+    Puts stdin into cbreak (unbuffered, no-echo) mode so keypresses are
+    received immediately without the user pressing Enter. Unlike raw mode
+    this keeps output newline handling, so live displays redraw correctly.
+    Restores the original terminal settings on exit regardless of how it ends.
     '''
     fd = sys.stdin.fileno()
     try:
@@ -20,9 +21,9 @@ def watch_for_quit(stop_event: threading.Event):
         # stdin is not a tty (e.g. in tests or piped input) — skip listener
         return
     try:
-        tty.setraw(fd)
+        tty.setcbreak(fd)
         while not stop_event.is_set():
-            # os.read is non-blocking after setraw; use select to avoid busy-wait
+            # os.read would block; use select to avoid busy-wait
             import select
             readable, _, _ = select.select([sys.stdin], [], [], 0.1)
             if readable:

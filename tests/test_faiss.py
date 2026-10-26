@@ -18,7 +18,9 @@ from matcha.faiss_index import (
     rebuild_recommended,
     maybe_rebuild_index,
     load_index,
+    find_candidate_pairs,
     _load_new_hashes,
+    _pairs_with_votes,
     _target_nlist,
 )
 
@@ -285,3 +287,72 @@ class TestMaybeRebuild:
         assert idx.ntotal == 40
         assert id_map.shape[0] == 40                   # tombstones compacted away
         assert int((id_map[:, 0] == -1).sum()) == 0
+
+def _add_video_with_hashes(b: _Builder, vid: int, phashes: list[str]):
+    conn = get_connection(b.db_path)
+    with conn:
+        conn.execute(
+            "INSERT INTO videos (id, path, duration, fingerprinted_at) VALUES (?, ?, ?, ?)",
+            (vid, f"/videos/{vid}.mp4", float(len(phashes)), 1.0),
+        )
+        conn.executemany(
+            "INSERT INTO frame_hashes (video_id, timestamp, phash) VALUES (?, ?, ?)",
+            [(vid, float(t), h) for t, h in enumerate(phashes)],
+        )
+
+
+def _stored_pairs(b: _Builder) -> set[tuple[int, int]]:
+    conn = get_connection(b.db_path)
+    return {(r["video_a_id"], r["video_b_id"]) for r in conn.execute("SELECT video_a_id, video_b_id FROM candidate_pairs")}
+
+
+class TestOffsetVotes:
+    def test_votes_need_distinct_frames_on_one_offset(self):
+        pair = (1 << 32) | 2
+        packed = np.array([pair] * 4, dtype=np.int64)
+        # three distinct lo frames at offset 5, one stray hit at offset 9
+        offsets = np.array([5, 5, 5, 9], dtype=np.int64)
+        lo_frames = np.array([0, 1, 2, 3], dtype=np.int64)
+        assert _pairs_with_votes(packed, offsets, lo_frames, 3).tolist() == [pair]
+        assert _pairs_with_votes(packed, offsets, lo_frames, 4).tolist() == []
+
+    def test_hit_seen_from_both_videos_votes_once(self):
+        pair = (1 << 32) | 2
+        packed = np.array([pair, pair], dtype=np.int64)
+        offsets = np.array([5, 5], dtype=np.int64)
+        lo_frames = np.array([0, 0], dtype=np.int64)
+        assert _pairs_with_votes(packed, offsets, lo_frames, 2).tolist() == []
+
+    def _build(self, tmp_path) -> _Builder:
+        b = _Builder(tmp_path)
+        clip = [_spread(i) for i in range(10)]
+        _add_video_with_hashes(b, 1, clip)
+        _add_video_with_hashes(b, 2, [_spread(100 + i) for i in range(3)] + clip)  # shares the clip at offset 3
+        _add_video_with_hashes(b, 3, [clip[0]] + [_spread(200 + i) for i in range(9)])  # shares one frame only
+        _add_video_with_hashes(b, 4, [_spread(300 + i) for i in range(10)])
+        update_index(b.db_path, b.index_dir)
+        return b
+
+    def _search(self, b: _Builder, min_votes: int):
+        return find_candidate_pairs(
+            b.db_path, b.index_dir, threshold=0, nprobe=1000, workers=1, min_votes=min_votes,
+        )
+
+    def test_single_frame_hit_dropped_at_two_votes(self, tmp_path):
+        b = self._build(tmp_path)
+        pairs, stopped = self._search(b, min_votes=2)
+        assert not stopped
+        assert pairs == {(1, 2)}
+        assert _stored_pairs(b) == {(1, 2)}
+
+    def test_one_vote_keeps_every_hit(self, tmp_path):
+        b = self._build(tmp_path)
+        pairs, _ = self._search(b, min_votes=1)
+        assert pairs == {(1, 2), (1, 3), (2, 3)}  # video 3's frame also matches video 2's copy of the clip
+
+    def test_changing_min_votes_requeries_and_clears_old_pairs(self, tmp_path):
+        b = self._build(tmp_path)
+        self._search(b, min_votes=1)
+        assert _stored_pairs(b) == {(1, 2), (1, 3), (2, 3)}
+        self._search(b, min_votes=2)
+        assert _stored_pairs(b) == {(1, 2)}

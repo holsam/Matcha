@@ -31,7 +31,8 @@ def match(
     threshold: int = typer.Option(10, help="Max Hamming distance to count a frame as matching (0-64)."),
     min_confidence: float = typer.Option(0.8, help="Minimum match ratio to record a result (0.0-1.0)."),
     workers: int = typer.Option(4, help="Number of parallel matching workers."),
-    nprobe: int = typer.Option(32, help='FAISS IVF cells to prove (increasing nprobe increases accuracy and runtime).')
+    nprobe: int = typer.Option(32, help='FAISS IVF cells to prove (increasing nprobe increases accuracy and runtime).'),
+    min_votes: int = typer.Option(2, help='Frame hits that must agree on one offset for a pair to become a candidate (1 keeps every hit).'),
 ):
     """Compare indexed videos and record matches in .matcha/index.db."""
     run_match(
@@ -42,7 +43,8 @@ def match(
         threshold=threshold,
         min_confidence=min_confidence,
         workers=workers,
-        nprobe=nprobe
+        nprobe=nprobe,
+        min_votes=min_votes,
     )
 
 

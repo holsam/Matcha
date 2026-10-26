@@ -1,11 +1,15 @@
 import itertools, os, threading, time, typer
 import numpy as np
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from numpy.lib.stride_tricks import sliding_window_view
 from datetime import datetime, timezone
 from rich import print
-from tqdm import tqdm
+from rich.console import Group
+from rich.live import Live
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.text import Text
 
 from matcha.config import save_run_config
 from matcha.db import get_connection
@@ -84,14 +88,11 @@ def generate_pairs(
     return pairs
 
 
-def get_compared_pairs(db_path: str) -> set[tuple[int, int]]:
-    conn = get_connection(db_path)
-    rows = conn.execute("SELECT video_a_id, video_b_id FROM comparisons").fetchall()
-    return {(row["video_a_id"], row["video_b_id"]) for row in rows}
-
-
 # _FLUSH_EVERY: comparisons buffered before a DB write
 _FLUSH_EVERY = 500
+
+# _RECENT_MATCHES: matches shown at once in the live display
+_RECENT_MATCHES = 10
 
 # _flush_results: write buffered comparisons and matches in one transaction
 def _flush_results(
@@ -170,6 +171,7 @@ def run_match(
     min_confidence: float = 0.8,
     workers: int = 4,
     nprobe: int = 32,
+    min_votes: int = 2,
 ):
     """Main entry point for the match subcommand."""
     directory = os.path.abspath(directory)
@@ -182,6 +184,7 @@ def run_match(
         "min_confidence": min_confidence,
         "workers": workers,
         "nprobe": nprobe,
+        "min_votes": min_votes,
     })
 
     index_dir = os.path.join(directory, ".matcha")
@@ -216,26 +219,30 @@ def run_match(
         nprobe=nprobe,
         batch_size=10_000,
         workers=workers,
+        min_votes=min_votes,
     )
     if candidates_stopped_early:
         typer.echo("\nStopped early during candidate search. Progress has been saved — resume with `matcha match`.")
         return
-    all_candidates: set[tuple[int, int]] = {
-        (row['video_a_id'], row['video_b_id'])
-        for row in conn.execute('SELECT video_a_id, video_b_id FROM candidate_pairs').fetchall()
-    }
-    _print_message('2', f'{len(all_candidates):,} candidate pairs identified ({len(new_candidates):,} new this run).')
+    n_candidates = conn.execute('SELECT COUNT(*) FROM candidate_pairs').fetchone()[0]
+    _print_message('2', f'{n_candidates:,} candidate pairs identified ({len(new_candidates):,} new this run).')
     # Pass 2
     _print_message('3', 'Starting Pass 2 (candidate comparisons)...')
-    already_compared = get_compared_pairs(db_path)
     pairs_to_run: list[tuple[VideoRecord, VideoRecord]] = []
     too_short: list[tuple[VideoRecord, VideoRecord]] = []
-    skipped = 0
     _print_message('3.1', 'Verifying candidates...')
-    for a_id, b_id in all_candidates:
-        if (a_id, b_id) in already_compared or (b_id, a_id) in already_compared:
-            skipped += 1
-            continue
+    # both tables store pairs as (min, max), so the anti-join finds uncompared pairs in sqlite instead of holding both tables as python sets
+    uncompared = conn.execute(
+        '''
+        SELECT c.video_a_id, c.video_b_id
+        FROM candidate_pairs c
+        LEFT JOIN comparisons p ON p.video_a_id = c.video_a_id AND p.video_b_id = c.video_b_id
+        WHERE p.video_a_id IS NULL
+        '''
+    )
+    n_uncompared = 0
+    for a_id, b_id in uncompared:
+        n_uncompared += 1
         a = video_map.get(a_id)
         b = video_map.get(b_id)
         if a is None or b is None:
@@ -247,11 +254,12 @@ def run_match(
             too_short.append((short, long))
         else:
             pairs_to_run.append((short, long))
+    skipped = n_candidates - n_uncompared
     _print_message('3.1', 'All candidates verified.')
     _print_message('3.2', 'Pass 2 pairs:')
     _print_message('3.2.1', f'Pairs to verify: {len(pairs_to_run)}')
     _print_message('3.2.2', f'Already compared: {skipped}')
-    _print_message('3.3.3', f'Too short to check: {len(too_short)}')
+    _print_message('3.2.3', f'Too short to check: {len(too_short)}')
     _flush_results(db_path, [(short.id, long.id) for short, long in too_short], [])
     if not pairs_to_run:
         _print_message('3.3', 'No eligible pairs to verify')
@@ -263,9 +271,7 @@ def run_match(
         (s.id, l.id, hashes[s.id], hashes[l.id], frame_step, threshold)
         for s, l in pairs_to_run
     ]
-    if filter_length:
-        typer.echo("Length filter: on")
-    typer.echo("Press 'q' to stop matching early.\n")
+    _print_message('3.5', f"Comparing frame hashes for {len(worker_args):,} pair(s) (length filter {'on' if filter_length else 'off'})... (press q to stop early)")
     matches_found = 0
     stopped_early = False
     stop_event = threading.Event()
@@ -273,11 +279,17 @@ def run_match(
     quit_thread.start()
     pending_comparisons: list[tuple[int, int]] = []
     pending_matches: list[tuple[int, int, str, float]] = []
+    # recent_matches: newest matches shown under the progress bar, the display clears when matching finishes
+    recent_matches: deque[str] = deque(maxlen=_RECENT_MATCHES)
+    progress = Progress(
+        TextColumn('Comparing'), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(), TimeRemainingColumn(),
+    )
+    task = progress.add_task('compare', total=len(worker_args))
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             chunks = [worker_args[i:i + _PAIR_CHUNK] for i in range(0, len(worker_args), _PAIR_CHUNK)]
             futures = {executor.submit(_compare_chunk, chunk): chunk for chunk in chunks}
-            with tqdm(total=len(worker_args), unit="pair", dynamic_ncols=True) as bar:
+            with Live(progress, transient=True, refresh_per_second=10) as live:
                 for future in as_completed(futures):
                     if stop_event.is_set():
                         # Cancel all queued futures — in-flight ones finish but
@@ -294,11 +306,13 @@ def run_match(
                             match_type = determine_match_type(short, long)
                             pending_matches.append((short_id, long_id, match_type, confidence))
                             matches_found += 1
-                            bar.write(
+                            recent_matches.append(
                                 f"  MATCH  {match_type:<10}  {confidence:.0%}  "
                                 f"{os.path.basename(short.path)}  ←  {os.path.basename(long.path)}"
                             )
-                        bar.update(1)
+                        progress.advance(task)
+                    # Text (not markup) so filenames containing brackets render literally
+                    live.update(Group(progress, Text('\n'.join(recent_matches), no_wrap=True, overflow='ellipsis')))
                     if len(pending_comparisons) >= _FLUSH_EVERY:
                         _flush_results(db_path, pending_comparisons, pending_matches)
     finally:
@@ -309,5 +323,3 @@ def run_match(
         typer.echo("\nStopped early. Progress has been saved — resume with `matcha match`.")
     else:
         typer.echo(f"\nDone. {matches_found} match(es) found from {len(pairs_to_run)} comparison(s).")
-        if matches_found:
-            typer.echo("Run `matcha move` to organise matched files into duplicates/.")

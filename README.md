@@ -109,6 +109,7 @@ To improve speed, the `--no-audio` and `--hwaccel` flags can be used. The former
 | `--min-confidence` |  `0.8` | Minimum match ratio to record a result (0.0–1.0) |
 | `--workers` |  `4` | Parallel comparison workers |
 | `--nprobe` | `32` | FAISS IVF cells to probe at query time (higher = more accurate but slower) |
+| `--min-votes` | `2` | Frame hits that must agree on one offset between two videos for the pair to go on to Pass 2 (`1` keeps every near-identical frame hit) |
 
 ```sh
 # Compare all indexed videos with defaults
