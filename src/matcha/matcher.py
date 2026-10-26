@@ -1,11 +1,15 @@
 import itertools, os, threading, time, typer
 import numpy as np
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from numpy.lib.stride_tricks import sliding_window_view
 from datetime import datetime, timezone
 from rich import print
-from tqdm import tqdm
+from rich.console import Group
+from rich.live import Live
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.text import Text
 
 from matcha.config import save_run_config
 from matcha.db import get_connection
@@ -86,6 +90,9 @@ def generate_pairs(
 
 # _FLUSH_EVERY: comparisons buffered before a DB write
 _FLUSH_EVERY = 500
+
+# _RECENT_MATCHES: matches shown at once in the live display
+_RECENT_MATCHES = 10
 
 # _flush_results: write buffered comparisons and matches in one transaction
 def _flush_results(
@@ -252,7 +259,7 @@ def run_match(
     _print_message('3.2', 'Pass 2 pairs:')
     _print_message('3.2.1', f'Pairs to verify: {len(pairs_to_run)}')
     _print_message('3.2.2', f'Already compared: {skipped}')
-    _print_message('3.3.3', f'Too short to check: {len(too_short)}')
+    _print_message('3.2.3', f'Too short to check: {len(too_short)}')
     _flush_results(db_path, [(short.id, long.id) for short, long in too_short], [])
     if not pairs_to_run:
         _print_message('3.3', 'No eligible pairs to verify')
@@ -264,9 +271,7 @@ def run_match(
         (s.id, l.id, hashes[s.id], hashes[l.id], frame_step, threshold)
         for s, l in pairs_to_run
     ]
-    if filter_length:
-        typer.echo("Length filter: on")
-    typer.echo("Press 'q' to stop matching early.\n")
+    _print_message('3.5', f"Comparing frame hashes for {len(worker_args):,} pair(s) (length filter {'on' if filter_length else 'off'})... (press q to stop early)")
     matches_found = 0
     stopped_early = False
     stop_event = threading.Event()
@@ -274,11 +279,17 @@ def run_match(
     quit_thread.start()
     pending_comparisons: list[tuple[int, int]] = []
     pending_matches: list[tuple[int, int, str, float]] = []
+    # recent_matches: newest matches shown under the progress bar, the display clears when matching finishes
+    recent_matches: deque[str] = deque(maxlen=_RECENT_MATCHES)
+    progress = Progress(
+        TextColumn('Comparing'), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(), TimeRemainingColumn(),
+    )
+    task = progress.add_task('compare', total=len(worker_args))
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             chunks = [worker_args[i:i + _PAIR_CHUNK] for i in range(0, len(worker_args), _PAIR_CHUNK)]
             futures = {executor.submit(_compare_chunk, chunk): chunk for chunk in chunks}
-            with tqdm(total=len(worker_args), unit="pair", dynamic_ncols=True) as bar:
+            with Live(progress, transient=True, refresh_per_second=10) as live:
                 for future in as_completed(futures):
                     if stop_event.is_set():
                         # Cancel all queued futures — in-flight ones finish but
@@ -295,11 +306,13 @@ def run_match(
                             match_type = determine_match_type(short, long)
                             pending_matches.append((short_id, long_id, match_type, confidence))
                             matches_found += 1
-                            bar.write(
+                            recent_matches.append(
                                 f"  MATCH  {match_type:<10}  {confidence:.0%}  "
                                 f"{os.path.basename(short.path)}  ←  {os.path.basename(long.path)}"
                             )
-                        bar.update(1)
+                        progress.advance(task)
+                    # Text (not markup) so filenames containing brackets render literally
+                    live.update(Group(progress, Text('\n'.join(recent_matches), no_wrap=True, overflow='ellipsis')))
                     if len(pending_comparisons) >= _FLUSH_EVERY:
                         _flush_results(db_path, pending_comparisons, pending_matches)
     finally:
@@ -310,5 +323,3 @@ def run_match(
         typer.echo("\nStopped early. Progress has been saved — resume with `matcha match`.")
     else:
         typer.echo(f"\nDone. {matches_found} match(es) found from {len(pairs_to_run)} comparison(s).")
-        if matches_found:
-            typer.echo("Run `matcha move` to organise matched files into duplicates/.")
