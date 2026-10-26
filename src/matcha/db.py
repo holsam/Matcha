@@ -107,6 +107,10 @@ def init_schema(db_path: str):
             if col not in cols:
                 conn.execute(f"ALTER TABLE videos ADD COLUMN {col} TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_content_key ON videos(content_key)")
+        # the composite primary keys only cover video_a_id, so without these every video delete (and its foreign key check) scans the whole table
+        for table in ('comparisons', 'candidate_pairs', 'matches'):
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_b ON {table}(video_b_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_matches_a ON matches(video_a_id)")
         # databases created before review-ui lack the dismissed flag on matches
         match_cols = {row['name'] for row in conn.execute("PRAGMA table_info(matches)")}
         if 'dismissed' not in match_cols:
