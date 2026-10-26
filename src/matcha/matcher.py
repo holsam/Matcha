@@ -84,12 +84,6 @@ def generate_pairs(
     return pairs
 
 
-def get_compared_pairs(db_path: str) -> set[tuple[int, int]]:
-    conn = get_connection(db_path)
-    rows = conn.execute("SELECT video_a_id, video_b_id FROM comparisons").fetchall()
-    return {(row["video_a_id"], row["video_b_id"]) for row in rows}
-
-
 # _FLUSH_EVERY: comparisons buffered before a DB write
 _FLUSH_EVERY = 500
 
@@ -220,22 +214,25 @@ def run_match(
     if candidates_stopped_early:
         typer.echo("\nStopped early during candidate search. Progress has been saved — resume with `matcha match`.")
         return
-    all_candidates: set[tuple[int, int]] = {
-        (row['video_a_id'], row['video_b_id'])
-        for row in conn.execute('SELECT video_a_id, video_b_id FROM candidate_pairs').fetchall()
-    }
-    _print_message('2', f'{len(all_candidates):,} candidate pairs identified ({len(new_candidates):,} new this run).')
+    n_candidates = conn.execute('SELECT COUNT(*) FROM candidate_pairs').fetchone()[0]
+    _print_message('2', f'{n_candidates:,} candidate pairs identified ({len(new_candidates):,} new this run).')
     # Pass 2
     _print_message('3', 'Starting Pass 2 (candidate comparisons)...')
-    already_compared = get_compared_pairs(db_path)
     pairs_to_run: list[tuple[VideoRecord, VideoRecord]] = []
     too_short: list[tuple[VideoRecord, VideoRecord]] = []
-    skipped = 0
     _print_message('3.1', 'Verifying candidates...')
-    for a_id, b_id in all_candidates:
-        if (a_id, b_id) in already_compared or (b_id, a_id) in already_compared:
-            skipped += 1
-            continue
+    # both tables store pairs as (min, max), so the anti-join finds uncompared pairs in sqlite instead of holding both tables as python sets
+    uncompared = conn.execute(
+        '''
+        SELECT c.video_a_id, c.video_b_id
+        FROM candidate_pairs c
+        LEFT JOIN comparisons p ON p.video_a_id = c.video_a_id AND p.video_b_id = c.video_b_id
+        WHERE p.video_a_id IS NULL
+        '''
+    )
+    n_uncompared = 0
+    for a_id, b_id in uncompared:
+        n_uncompared += 1
         a = video_map.get(a_id)
         b = video_map.get(b_id)
         if a is None or b is None:
@@ -247,6 +244,7 @@ def run_match(
             too_short.append((short, long))
         else:
             pairs_to_run.append((short, long))
+    skipped = n_candidates - n_uncompared
     _print_message('3.1', 'All candidates verified.')
     _print_message('3.2', 'Pass 2 pairs:')
     _print_message('3.2.1', f'Pairs to verify: {len(pairs_to_run)}')
