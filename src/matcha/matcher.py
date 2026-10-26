@@ -164,6 +164,7 @@ def run_match(
     min_confidence: float = 0.8,
     workers: int = 4,
     nprobe: int = 32,
+    min_votes: int = 2,
 ):
     """Main entry point for the match subcommand."""
     directory = os.path.abspath(directory)
@@ -176,6 +177,7 @@ def run_match(
         "min_confidence": min_confidence,
         "workers": workers,
         "nprobe": nprobe,
+        "min_votes": min_votes,
     })
 
     index_dir = os.path.join(directory, ".matcha")
@@ -210,6 +212,7 @@ def run_match(
         nprobe=nprobe,
         batch_size=10_000,
         workers=workers,
+        min_votes=min_votes,
     )
     if candidates_stopped_early:
         typer.echo("\nStopped early during candidate search. Progress has been saved — resume with `matcha match`.")
