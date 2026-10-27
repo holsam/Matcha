@@ -42,6 +42,13 @@ def test_probe_and_thumbnail(clip, tmp_path):
 
 
 @needs_ffmpeg
+def test_probe_reports_fps_and_duration(clip):
+    p = media.probe(clip)
+    assert p.fps == pytest.approx(5.0)
+    assert p.duration == pytest.approx(2.0, abs=0.2)
+
+
+@needs_ffmpeg
 def test_unreadable_file_degrades(tmp_path):
     bad = tmp_path / "bad.mp4"
     bad.write_text("not a video")
