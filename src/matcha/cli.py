@@ -107,8 +107,11 @@ def reencode(
     preview: int = typer.Option(0, help="Build side-by-side comparison clips for N random candidates and stop."),
     bpps: str = typer.Option("0.03,0.06,0.10", help="Comma separated bpp values to compare with --preview."),
     preview_dir: str | None = typer.Option(None, "--preview-dir", help="Where --preview writes (default: .matcha/tmp)."),
+    execute: bool = typer.Option(False, "--apply", help="Re-encode the candidates in place (default is a dry run)."),
+    preset: str = typer.Option("medium", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
 ):
-    """Profile videos by codec and bitrate and estimate the space re-encoding to HEVC would save."""
+    """Profile videos by codec and bitrate, and re-encode bloated ones to HEVC."""
     run_reencode(
         directory,
         bpp=bpp,
@@ -118,7 +121,11 @@ def reencode(
         preview=preview,
         bpps=bpps,
         preview_dir=preview_dir,
+        apply=execute,
+        preset=preset,
+        yes=yes,
     )
+
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(

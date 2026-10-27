@@ -14,8 +14,15 @@ from rich.progress import track
 from rich.table import Table
 
 # Import internal matcha objects
+from matcha.db import fold_in_moved_paths, repoint_video
 from matcha.indexer import find_videos
 from matcha.review.media import human_size, probe
+
+# _HEVC_OK: containers that hold HEVC and keep their extension, anything else becomes mkv
+_HEVC_OK = {'.mp4', '.mkv', '.mov'}
+
+# _APPLE_TAG: containers that need the hvc1 tag for Apple players
+_APPLE_TAG = {'.mp4', '.mov'}
 
 # _BLOAT: a file is reported as bloated above this multiple of the bpp its codec needs
 _BLOAT = 1.5
@@ -151,7 +158,57 @@ def _previews(cands: list[Info], n: int, bpps: list[float], out_dir: str, consol
     outs = [_preview(i, bpps, out_dir, k) for k, i in enumerate(track(picks, description='Previewing'))]
     console.print('\n'.join(['Previews:', *(os.path.abspath(o) for o in outs)]))
 
-# run_reencode: profile the library, then optionally build preview clips
+# _target: path the re-encoded file gets, the original path unless its container cannot hold hevc
+def _target(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    return path if ext.lower() in _HEVC_OK else root + '.mkv'
+
+# _encode: re-encode to tmp at bpp keeping audio and subtitles, returns ffmpeg's last error line or None on success
+def _encode(i: Info, tmp: str, bpp: float, preset: str) -> str | None:
+    rate = int(i.width * i.height * i.fps * bpp)
+    cmd = ['ffmpeg', '-v', 'error', '-y', '-i', i.path, '-map', '0:v:0', '-map', '0:a?', '-map', '0:s?',
+           '-c', 'copy', '-c:v', 'libx265', '-preset', preset, '-b:v', str(rate), '-x265-params', 'log-level=error']
+    if os.path.splitext(tmp)[1].lower() in _APPLE_TAG:
+        cmd += ['-tag:v', 'hvc1']
+    proc = subprocess.run([*cmd, tmp], capture_output=True, text=True)
+    return None if proc.returncode == 0 else (proc.stderr.strip().splitlines() or ['ffmpeg failed'])[-1]
+
+# _verify: why the new file cannot replace the original, or None when it is hevc, the same length and 10% smaller
+def _verify(old: Info, tmp: str) -> str | None:
+    new = _info(tmp)
+    if new is None:
+        return 'output unreadable'
+    if new.codec != 'hevc':
+        return f'output is {new.codec}'
+    if abs(new.duration - old.duration) > 1:
+        return f'duration {new.duration:.1f}s vs {old.duration:.1f}s'
+    if new.size >= old.size * 0.9:
+        return 'output not at least 10% smaller'
+    return None
+
+# _reencode_one: encode beside the original, verify, then swap it in; returns (bytes saved, reason skipped)
+def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str) -> tuple[int, str]:
+    dst = _target(i.path)
+    tmp = f'{os.path.splitext(i.path)[0]}.reencoding{os.path.splitext(dst)[1]}'
+    try:
+        reason = _encode(i, tmp, bpp, preset) or _verify(i, tmp)
+        if reason:
+            return 0, reason
+        saved = i.size - os.path.getsize(tmp)
+        st = os.stat(i.path)
+        os.replace(tmp, dst)
+        if dst != i.path:
+            os.remove(i.path)
+        os.utime(dst, (st.st_atime, st.st_mtime))
+        if db_path:
+            # same path too: content_key hashes the old size
+            repoint_video(db_path, i.path, dst)
+        return saved, ''
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+# run_reencode: profile the library, then optionally build preview clips or re-encode the candidates in place
 def run_reencode(
     directory: str,
     *,
@@ -162,7 +219,11 @@ def run_reencode(
     preview: int = 0,
     bpps: str = '0.03,0.06,0.10',
     preview_dir: str | None = None,
+    apply: bool = False,
+    preset: str = 'medium',
+    yes: bool = False,
 ) -> None:
+    directory = os.path.abspath(directory)
     console = Console()
     paths = _videos(directory)
     infos = _probe_all(paths, probe_workers)
@@ -179,5 +240,22 @@ def run_reencode(
         out_dir = preview_dir or os.path.join(os.path.abspath(directory), '.matcha', 'tmp')
         _previews([i for _, i in cands], preview, [float(b) for b in bpps.split(',')], out_dir, console)
         return
-    for s, i in cands[:20]:
-        console.print(escape(f'  {human_size(s):>10}  {i.codec:<6} {i.path}'))
+    if not apply:
+        for s, i in cands[:20]:
+            console.print(escape(f'  {human_size(s):>10}  {i.codec:<6} {i.path}'))
+        console.print('dry run: pass --apply to re-encode (originals are deleted)')
+        return
+    if not yes and input(f'Permanently delete {len(cands)} originals? Type yes to continue: ').strip() != 'yes':
+        raise SystemExit('aborted')
+    db = os.path.join(directory, '.matcha', 'index.db')
+    db_path = db if os.path.exists(db) else None
+    if db_path:
+        fold_in_moved_paths(db_path)  # videos from the old `move` command sit at moved_to, not path
+    saved = done = 0
+    for _, i in track(cands, description='Re-encoding'):
+        gained, reason = _reencode_one(i, db_path, bpp, preset)
+        saved += gained
+        done += bool(gained)
+        if reason:
+            console.print(escape(f'skipped {i.path}: {reason}'), style='yellow')
+    console.print(f'[bold green]{human_size(saved)}[/] saved across {done}/{len(cands)} files')

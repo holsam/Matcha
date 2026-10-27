@@ -9,13 +9,18 @@ from typer.testing import CliRunner
 
 from matcha import reencode
 from matcha.cli import app
-from matcha.reencode import Info, _info, _candidates, _label, _preview, _videos, run_reencode
+from matcha.db import get_connection, init_schema
+from matcha.reencode import Info, _info, _candidates, _label, _preview, _verify, _videos, run_reencode
 from matcha.review.media import Probe, probe
 
 # H264: 1080p30 at 8 Mbps for 100 s, about 0.13 bpp
 H264 = Info('a.mp4', 105_000_000, 100.0, 1920, 1080, 30.0, 'h264', 8_000_000)
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg not installed')
+
+# apply: run_reencode with thresholds low enough for a tiny clip and a fast preset
+def apply(directory, **kw) -> None:
+    run_reencode(str(directory), apply=True, yes=True, min_saving_mb=0, min_saving_pct=0, preset='ultrafast', **kw)
 
 # make_clip: 2 s noisy 320x240 clip at a very high bitrate, so its bpp is far above any target
 def make_clip(path: Path, *codec: str) -> Path:
@@ -98,13 +103,11 @@ def test_label_height(tmp_path):
     _label('0.06 bpp (1.0 Mbps, hevc)', str(tmp_path / 'l.png'))
     assert Image.open(tmp_path / 'l.png').height == 36
 
-
 @needs_ffmpeg
 def test_preview_stitches_original_and_encodes_side_by_side(tmp_path):
     info = _info(str(make_clip(tmp_path / 'a.mp4')))
     out = probe(_preview(info, [0.06], str(tmp_path), 0))
     assert (out.width, out.height) == (2 * 480, 360)  # two panels scaled to 360 high
-
 
 @needs_ffmpeg
 def test_preview_flag_writes_comparisons_and_touches_no_originals(tmp_path):
@@ -113,3 +116,56 @@ def test_preview_flag_writes_comparisons_and_touches_no_originals(tmp_path):
     run_reencode(str(tmp_path), min_saving_mb=0, min_saving_pct=0, preview=1, bpps='0.06')
     assert len(list((tmp_path / '.matcha' / 'tmp').glob('*_compare.mp4'))) == 1
     assert clip.read_bytes() == before
+
+@needs_ffmpeg
+def test_verify_accepts_a_smaller_same_length_hevc_file(tmp_path):
+    old = _info(str(make_clip(tmp_path / 'a.mp4')))
+    new = make_clip(tmp_path / 'b.mp4', '-c:v', 'libx265', '-crf', '28')
+    assert _verify(replace(old, size=10**9), str(new)) is None
+    assert 'duration' in _verify(replace(old, size=10**9, duration=old.duration + 5), str(new))
+    assert 'smaller' in _verify(replace(old, size=1), str(new))
+    assert 'h264' in _verify(replace(old, size=10**9), str(tmp_path / 'a.mp4'))
+    assert 'unreadable' in _verify(old, str(tmp_path / 'missing.mp4'))
+
+@needs_ffmpeg
+def test_apply_keeps_path_codec_and_mtime_of_an_mp4(tmp_path):
+    clip = make_clip(tmp_path / 'a.mp4')
+    os.utime(clip, (1_000_000_000, 1_000_000_000))
+    before = clip.stat().st_size
+    apply(tmp_path)
+    assert probe(str(clip)).codec == 'hevc'
+    assert clip.stat().st_size < before
+    assert int(clip.stat().st_mtime) == 1_000_000_000
+    assert list(tmp_path.glob('*.reencoding.*')) == []
+
+@needs_ffmpeg
+def test_apply_turns_an_avi_into_mkv_and_repoints_the_index(tmp_path):
+    avi = make_clip(tmp_path / 'old.avi', '-c:v', 'mpeg4', '-q:v', '2')
+    (tmp_path / '.matcha').mkdir()
+    db_path = str(tmp_path / '.matcha' / 'index.db')
+    init_schema(db_path)
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute('INSERT INTO videos (id, path, duration, content_key) VALUES (1, ?, 2, ?)', (str(avi), 'k'))
+        conn.execute("INSERT INTO frame_hashes (video_id, timestamp, phash) VALUES (1, 0, 'ff')")
+    apply(tmp_path)
+    assert not avi.exists()
+    assert probe(str(tmp_path / 'old.mkv')).codec == 'hevc'
+    row = conn.execute('SELECT id, path, content_key FROM videos').fetchone()
+    assert tuple(row) == (1, str(tmp_path / 'old.mkv'), None)
+    assert conn.execute('SELECT COUNT(*) FROM frame_hashes').fetchone()[0] == 1
+
+@needs_ffmpeg
+def test_apply_adopts_paths_from_the_old_move_command_before_repointing(tmp_path):
+    (tmp_path / 'duplicates').mkdir()
+    held = make_clip(tmp_path / 'duplicates' / 'v.mp4')  # where the old move command left it
+    (tmp_path / '.matcha').mkdir()
+    db_path = str(tmp_path / '.matcha' / 'index.db')
+    init_schema(db_path)
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute('INSERT INTO videos (id, path, duration, moved_to) VALUES (1, ?, 2, ?)',
+                     (str(tmp_path / 'v.mp4'), str(held)))
+    apply(tmp_path)
+    assert tuple(conn.execute('SELECT path, moved_to FROM videos').fetchone()) == (str(held), None)
+    assert probe(str(held)).codec == 'hevc'
