@@ -15,6 +15,9 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
+# Import internal matcha objects
+from matcha.db import dismiss_matches, init_schema, purge_video
+
 # _VIDEO_TABLES: tables keyed by a single video_id, purged before the video row (FK order)
 _VIDEO_TABLES = ('frame_hashes', 'audio_fingerprints', 'candidate_search_progress')
 
@@ -181,19 +184,13 @@ def _remove(path: str) -> tuple[str, str]:
         return 'failed', str(e)
     return 'ok', 'removed'
 
-# _purge: delete a video's rows, children first, in one transaction (same order as matcha's delete_video_record)
+# _purge: delete a video's rows in one transaction
 def _purge(conn: sqlite3.Connection, vid: int) -> tuple[str, str]:
     try:
-        with conn:
-            rows = sum(conn.execute(f'DELETE FROM {t} WHERE video_id = ?', (vid,)).rowcount for t in _VIDEO_TABLES)
-            rows += sum(
-                conn.execute(f'DELETE FROM {t} WHERE video_a_id = ? OR video_b_id = ?', (vid, vid)).rowcount
-                for t in _PAIR_TABLES
-            )
-            rows += conn.execute('DELETE FROM videos WHERE id = ?', (vid,)).rowcount
+        rows = purge_video(conn, vid)
     except sqlite3.Error as e:
         return 'failed', str(e)
-    return 'ok', f'{rows} rows across {len(_VIDEO_TABLES) + len(_PAIR_TABLES) + 1} tables'
+    return 'ok', f'{rows} rows'
 
 # _rename_file: rename on disk
 def _rename_file(src: str, dst: str) -> tuple[str, str]:
@@ -212,16 +209,10 @@ def _update_path(conn: sqlite3.Connection, vid: int, dst: str) -> tuple[str, str
         return 'failed', str(e)
     return ('ok', 'row updated') if n == 1 else ('failed', 'no such video row')
 
-# _dismiss: mark matches between the surviving videos as dismissed, adding the column if an old db lacks it
+# _dismiss: mark matches between the surviving videos as dismissed
 def _dismiss(conn: sqlite3.Connection, ids: list[int]) -> tuple[str, str]:
-    marks = ','.join('?' * len(ids))
     try:
-        with conn:
-            if 'dismissed' not in {r[1] for r in conn.execute('PRAGMA table_info(matches)')}:
-                conn.execute('ALTER TABLE matches ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0')
-            n = conn.execute(
-                f'UPDATE matches SET dismissed = 1 WHERE video_a_id IN ({marks}) AND video_b_id IN ({marks})', ids + ids
-            ).rowcount
+        n = dismiss_matches(conn, ids)
     except sqlite3.Error as e:
         return 'failed', str(e)
     return 'ok', f'{n} matches'
@@ -334,6 +325,27 @@ def _apply_group(ctx: Ctx, group: dict, title: str) -> None:
     ctx.display.end_group(ctx.stats['freed'])
 
 
+# _unindexed: deleted videos whose rows are gone but whose FAISS vectors have not been removed yet
+def _unindexed(plan: dict) -> list[dict]:
+    return [f for g in plan['groups'] for f in g['files'] if f['action'] == 'delete' and _done(f, 'db') and not _done(f, 'index')]
+
+# _remove_vectors: drop the deleted videos' vectors from the FAISS index in one pass, recording each in the plan
+def _remove_vectors(ctx: Ctx, console: Console, matcha_dir: str) -> None:
+    todo = _unindexed(ctx.plan)
+    if not todo:
+        return
+    try:
+        # lazy import, faiss is slow to load and only needed here
+        from matcha.faiss_index import remove_videos_from_index
+        n = remove_videos_from_index(matcha_dir, [f['id'] for f in todo])
+    except Exception as e:
+        ctx.failures.append(('remove vectors', str(e)))
+        return
+    for f in todo:
+        f.setdefault('applied', {})['index'] = 'ok'
+    _save_plan(ctx)
+    console.print(f'{n} vectors removed from the faiss index')
+
 # _pending: (deletes, renames, bytes) still to do across the plan
 def _pending(plan: dict) -> tuple[int, int, int]:
     todo = [f for g in plan['groups'] for f in g['files'] if f['action'] in ('delete', 'rename') and not (_done(f, 'file') and _done(f, 'db'))]
@@ -359,13 +371,15 @@ def run(directory: str, plan_path: str | None = None, *, apply: bool = False, ye
 
     deletes, renames, size = _pending(plan)
     console.print(f'plan: [bold]{deletes}[/] deletes ({_fmt(size)}), [bold]{renames}[/] renames pending' + ('' if apply else '  [cyan](dry run, pass --apply to execute)[/]'))
-    if not deletes and not renames:
+    if not deletes and not renames and not (apply and _unindexed(plan)):
         console.print('nothing to apply')
         return 0
     if apply and not yes and input(f'Permanently delete {deletes} files? Type yes to continue: ').strip() != 'yes':
         console.print('aborted')
         return 1
 
+    if apply:
+        init_schema(db_path)  # databases predating the dismissed flag lack it
     conn = sqlite3.connect(db_path)
     conn.execute('PRAGMA foreign_keys=ON')
     conn.execute('PRAGMA busy_timeout=5000')
@@ -381,6 +395,8 @@ def run(directory: str, plan_path: str | None = None, *, apply: bool = False, ye
                 display.end_group(ctx.stats['freed'])
             else:
                 _apply_group(ctx, group, title)
+    if not ctx.dry:
+        _remove_vectors(ctx, console, os.path.dirname(db_path))
 
     verb = 'would be' if ctx.dry else 'were'
     console.print(f'\n[bold green]{_fmt(ctx.stats["freed"])}[/] freed: {ctx.stats["deleted"]} deleted, '

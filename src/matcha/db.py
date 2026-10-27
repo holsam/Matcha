@@ -143,16 +143,30 @@ def load_all_videos(db_path: str) -> list[dict]:
     rows = conn.execute("SELECT id, path, moved_to FROM videos").fetchall()
     return [{"id": r["id"], "path": r["path"], "moved_to": r["moved_to"]} for r in rows]
 
-# delete_video_record: remove a video and every row that references it
-def delete_video_record(db_path: str, video_id: int) -> None:
-    conn = get_connection(db_path)
+# purge_video: remove a video and every row that references it on an open connection, returning the rows deleted
+def purge_video(conn: sqlite3.Connection, video_id: int) -> int:
+    rows = 0
     with conn:
         # child rows first, foreign_keys is ON
         for table in ('frame_hashes', 'audio_fingerprints', 'candidate_search_progress'):
-            conn.execute(f"DELETE FROM {table} WHERE video_id = ?", (video_id,))
+            rows += conn.execute(f"DELETE FROM {table} WHERE video_id = ?", (video_id,)).rowcount
         for table in ('matches', 'comparisons', 'candidate_pairs'):
-            conn.execute(f"DELETE FROM {table} WHERE video_a_id = ? OR video_b_id = ?", (video_id, video_id))
-        conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+            rows += conn.execute(f"DELETE FROM {table} WHERE video_a_id = ? OR video_b_id = ?", (video_id, video_id)).rowcount
+        rows += conn.execute("DELETE FROM videos WHERE id = ?", (video_id,)).rowcount
+    return rows
+
+# delete_video_record: remove a video and every row that references it
+def delete_video_record(db_path: str, video_id: int) -> None:
+    purge_video(get_connection(db_path), video_id)
+
+# dismiss_matches: mark every match among the given videos as not-duplicates, returning the matches marked
+def dismiss_matches(conn: sqlite3.Connection, video_ids: list[int]) -> int:
+    marks = ','.join('?' * len(video_ids))
+    with conn:
+        return conn.execute(
+            f'UPDATE matches SET dismissed = 1 WHERE video_a_id IN ({marks}) AND video_b_id IN ({marks})',
+            [*video_ids, *video_ids],
+        ).rowcount
 
 # fold_in_moved_paths: adopt the legacy duplicates/ location as the real path so the review UI works in place
 def fold_in_moved_paths(db_path: str) -> int:

@@ -183,3 +183,76 @@ class TestResume:
         json.dump(plan, open(plan_path, 'w'))
         assert _apply(lib) == 0
         assert lib['conn'].execute('SELECT COUNT(*) FROM videos WHERE id = 2').fetchone()[0] == 0
+
+# _vectors: stub FAISS vector removal, returning the list of (index dir, ids) calls
+@pytest.fixture()
+def vectors(monkeypatch):
+    calls = []
+    monkeypatch.setattr('matcha.faiss_index.remove_videos_from_index', lambda d, ids: calls.append((d, sorted(ids))) or len(calls[-1][1]))
+    return calls
+
+# TestVectors: deleted videos leave the FAISS index too
+class TestVectors:
+    # test_deleted_ids_removed_once: one pass for the whole plan, pointed at .matcha
+    def test_deleted_ids_removed_once(self, lib, vectors):
+        _plan(lib, {1: 'keep', 2: 'delete', 3: 'delete'})
+        assert _apply(lib) == 0
+        assert vectors == [(str(lib['root'] / '.matcha'), [2, 3])]
+
+    # test_recorded_in_plan: the slot stops a second run repeating it
+    def test_recorded_in_plan(self, lib, vectors):
+        plan_path = _plan(lib, {1: 'keep', 2: 'delete'})
+        _apply(lib)
+        applied = json.load(open(plan_path))['groups'][0]['files'][1]['applied']
+        assert applied['index'] == 'ok'
+        assert _apply(lib) == 0
+        assert len(vectors) == 1
+
+    # test_renames_and_keeps_untouched: nothing to remove, faiss never loaded
+    def test_renames_and_keeps_untouched(self, lib, vectors):
+        _plan(lib, {1: 'keep', 2: 'renamed.mp4'})
+        _apply(lib)
+        assert vectors == []
+
+    # test_dry_run_leaves_index_alone: no removal when nothing changes
+    def test_dry_run_leaves_index_alone(self, lib, vectors):
+        _plan(lib, {1: 'keep', 2: 'delete'})
+        apply.run(lib['dir'], quiet=True, console=Console(file=io.StringIO()))
+        assert vectors == []
+
+    # test_failure_reported_and_retried: the plan stays unmarked so the next run tries again
+    def test_failure_reported_and_retried(self, lib, monkeypatch, vectors):
+        def boom(d, ids):
+            raise RuntimeError('index locked')
+        monkeypatch.setattr('matcha.faiss_index.remove_videos_from_index', boom)
+        plan_path = _plan(lib, {1: 'keep', 2: 'delete'})
+        assert _apply(lib) == 1
+        assert 'index' not in json.load(open(plan_path))['groups'][0]['files'][1]['applied']
+        monkeypatch.setattr('matcha.faiss_index.remove_videos_from_index', lambda d, ids: vectors.append(ids) or 1)
+        assert _apply(lib) == 0
+        assert vectors == [[2]]
+
+    # test_plan_applied_before_vectors_existed: rows already purged, vectors still owed
+    def test_plan_applied_before_vectors_existed(self, lib, vectors):
+        plan_path = _plan(lib, {1: 'keep', 2: 'delete'})
+        assert _apply(lib) == 0
+        plan = json.load(open(plan_path))
+        del plan['groups'][0]['files'][1]['applied']['index']
+        json.dump(plan, open(plan_path, 'w'))
+        vectors.clear()
+        assert _apply(lib) == 0
+        assert vectors == [(str(lib['root'] / '.matcha'), [2])]
+
+# TestDbHelpers: the shared purge and dismiss helpers
+class TestDbHelpers:
+    # test_purge_video_counts_rows: every referencing row goes and is counted
+    def test_purge_video_counts_rows(self, lib):
+        from matcha.db import purge_video
+        # video 3: videos row, 1 frame hash, 1 match (2,3), 1 candidate pair (1,3)
+        assert purge_video(lib['conn'], 3) == 4
+        assert _count(lib, 'videos') == 2
+
+    # test_dismiss_matches_counts: only matches inside the given set
+    def test_dismiss_matches_counts(self, lib):
+        from matcha.db import dismiss_matches
+        assert dismiss_matches(lib['conn'], [1, 2]) == 1
