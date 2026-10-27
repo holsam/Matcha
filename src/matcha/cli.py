@@ -4,6 +4,7 @@ import typer
 from matcha.apply import run as run_apply
 from matcha.continuer import run_continue
 from matcha.db import fold_in_moved_paths, init_schema
+from matcha.plan import run_plan
 from matcha.indexer import run_index
 from matcha.matcher import run_match
 
@@ -71,6 +72,18 @@ def review(
         env={**os.environ, "MATCHA_REVIEW_DIR": directory},
         check=False,
     )
+
+@app.command(rich_help_panel="Review matches")
+def plan(
+    directory: str = typer.Argument(..., help="Directory containing .matcha/index.db."),
+    min_confidence: float = typer.Option(0.8, help="Minimum match confidence to group on."),
+    threshold: int = typer.Option(10, help="Max Hamming distance per frame, as used by `matcha match`."),
+    no_pause: bool = typer.Option(False, "--no-pause", help="Print every group without waiting for input."),
+    plan: str | None = typer.Option(None, "--plan", help="Plan file to write and resume from."),
+    restart: bool = typer.Option(False, "--restart", help="Ignore any existing plan and start again."),
+):
+    """Step through duplicate groups in the terminal and write a review plan."""
+    run_plan(directory, min_confidence=min_confidence, threshold=threshold, no_pause=no_pause, plan=plan, restart=restart)
 
 @app.command(name="apply", rich_help_panel="Review matches")
 def apply_(
