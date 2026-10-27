@@ -66,11 +66,11 @@ def test_bloat_uses_the_codecs_own_scale():
     assert replace(H264, codec='hevc').bloat(0.06) > H264.bloat(0.06)
     assert replace(H264, codec='unknown').bloat(0.06) == H264.bloat(0.06)  # unknown codecs count as h264
 
-def test_videos_skips_temp_files_and_the_matcha_dir(tmp_path):
-    for rel in ('a.mp4', 'b.txt', 'c.reencoding.mp4', '.matcha/d.mp4', 'sub/e.MKV'):
+def test_videos_skips_temp_files_matcha_dir_and_exclude(tmp_path):
+    for rel in ('a.mp4', 'b.txt', 'c.reencoding.mp4', '.matcha/d.mp4', 'sub/e.MKV', 'keep/f.mp4'):
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / rel).write_bytes(b'x')
-    got = _videos(str(tmp_path))
+    got = _videos(str(tmp_path), str(tmp_path / 'keep'))
     assert sorted(os.path.relpath(p, tmp_path) for p in got) == ['a.mp4', 'sub/e.MKV']
 
 def test_info_falls_back_from_video_bitrate_to_file_bitrate_to_size(tmp_path, monkeypatch):
@@ -169,3 +169,26 @@ def test_apply_adopts_paths_from_the_old_move_command_before_repointing(tmp_path
     apply(tmp_path)
     assert tuple(conn.execute('SELECT path, moved_to FROM videos').fetchone()) == (str(held), None)
     assert probe(str(held)).codec == 'hevc'
+
+@needs_ffmpeg
+def test_keep_originals_moves_the_original_and_links_the_new_file(tmp_path):
+    lib, keep = tmp_path / 'lib', tmp_path / 'keep'
+    (lib / 'sub').mkdir(parents=True)
+    avi = make_clip(lib / 'sub' / 'old.avi', '-c:v', 'mpeg4', '-q:v', '2')
+    mp4 = make_clip(lib / 'a.mp4')
+    sizes = {avi.name: avi.stat().st_size, mp4.name: mp4.stat().st_size}
+    run_reencode(str(lib), apply=True, min_saving_mb=0, min_saving_pct=0, preset='ultrafast', keep_originals=str(keep))
+    assert (keep / 'a.mp4').stat().st_size == sizes['a.mp4']
+    assert (keep / 'sub' / 'old.avi').stat().st_size == sizes['old.avi']
+    assert os.path.realpath(keep / 'a.reencoded.mp4') == os.path.realpath(mp4)
+    assert os.path.realpath(keep / 'sub' / 'old.reencoded.mkv') == os.path.realpath(lib / 'sub' / 'old.mkv')
+    assert probe(str(mp4)).codec == 'hevc'
+
+@needs_ffmpeg
+def test_keep_dir_inside_the_library_is_not_profiled(tmp_path):
+    make_clip(tmp_path / 'a.mp4')
+    keep = tmp_path / 'held'
+    run_reencode(str(tmp_path), apply=True, min_saving_mb=0, min_saving_pct=0, preset='ultrafast', keep_originals=str(keep))
+    before = (keep / 'a.mp4').read_bytes()
+    run_reencode(str(tmp_path), apply=True, min_saving_mb=0, min_saving_pct=0, preset='ultrafast', keep_originals=str(keep))
+    assert (keep / 'a.mp4').read_bytes() == before

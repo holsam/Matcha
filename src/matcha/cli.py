@@ -110,6 +110,7 @@ def reencode(
     execute: bool = typer.Option(False, "--apply", help="Re-encode the candidates in place (default is a dry run)."),
     preset: str = typer.Option("medium", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
     yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
+    keep_originals: str | None = typer.Option(None, "--keep-originals", help="Move originals here, with a symlink to each new file, instead of deleting."),
 ):
     """Profile videos by codec and bitrate, and re-encode bloated ones to HEVC."""
     run_reencode(
@@ -124,8 +125,8 @@ def reencode(
         apply=execute,
         preset=preset,
         yes=yes,
+        keep_originals=keep_originals,
     )
-
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(

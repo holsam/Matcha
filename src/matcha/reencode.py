@@ -3,7 +3,7 @@ MATCHA: profile a library by codec and bitrate, and re-encode bloated videos to 
 '''
 
 # Import external dependencies
-import os, random, subprocess
+import os, random, shutil, subprocess
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -76,9 +76,10 @@ def _info(path: str) -> Info | None:
     vbitrate = p.video_bitrate or p.bitrate or (int(size * 8 / duration) if duration else 0)
     return Info(path, size, duration, p.width, p.height, p.fps or 25.0, p.codec, vbitrate)
 
-# _videos: video paths under directory, minus temp files from an interrupted run
-def _videos(directory: str) -> list[str]:
-    return [p for p in find_videos(os.path.abspath(directory)) if '.reencoding.' not in os.path.basename(p)]
+# _videos: video paths under directory, minus temp files from an interrupted run and anything inside exclude
+def _videos(directory: str, exclude: str | None = None) -> list[str]:
+    return [p for p in find_videos(os.path.abspath(directory))
+            if '.reencoding.' not in os.path.basename(p) and not (exclude and p.startswith(exclude + os.sep))]
 
 # _probe_all: probe paths in parallel, dropping files ffprobe cannot read
 def _probe_all(paths: list[str], workers: int) -> list[Info]:
@@ -187,7 +188,7 @@ def _verify(old: Info, tmp: str) -> str | None:
     return None
 
 # _reencode_one: encode beside the original, verify, then swap it in; returns (bytes saved, reason skipped)
-def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str) -> tuple[int, str]:
+def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str, held: str | None) -> tuple[int, str]:
     dst = _target(i.path)
     tmp = f'{os.path.splitext(i.path)[0]}.reencoding{os.path.splitext(dst)[1]}'
     try:
@@ -196,8 +197,18 @@ def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str) -> tupl
             return 0, reason
         saved = i.size - os.path.getsize(tmp)
         st = os.stat(i.path)
-        os.replace(tmp, dst)
-        if dst != i.path:
+        if held:
+            os.makedirs(os.path.dirname(held), exist_ok=True)
+            shutil.move(i.path, held)  # copies across filesystems
+        try:
+            os.replace(tmp, dst)
+        except OSError:
+            if held:
+                shutil.move(held, i.path)  # put the original back
+            raise
+        if held:
+            os.symlink(dst, f'{os.path.splitext(held)[0]}.reencoded{os.path.splitext(dst)[1]}')
+        elif dst != i.path:
             os.remove(i.path)
         os.utime(dst, (st.st_atime, st.st_mtime))
         if db_path:
@@ -207,6 +218,7 @@ def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str) -> tupl
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
 
 # run_reencode: profile the library, then optionally build preview clips or re-encode the candidates in place
 def run_reencode(
@@ -222,10 +234,12 @@ def run_reencode(
     apply: bool = False,
     preset: str = 'medium',
     yes: bool = False,
+    keep_originals: str | None = None,
 ) -> None:
     directory = os.path.abspath(directory)
+    keep = os.path.abspath(keep_originals) if keep_originals else None
     console = Console()
-    paths = _videos(directory)
+    paths = _videos(directory, keep)
     infos = _probe_all(paths, probe_workers)
     if not infos:
         console.print('no videos found')
@@ -237,15 +251,15 @@ def run_reencode(
     est = sum(s for s, _ in cands)
     console.print(f'{len(cands)} of {len(infos)} files qualify, est. saving [bold green]{human_size(est)}[/] at {bpp} bpp')
     if preview:
-        out_dir = preview_dir or os.path.join(os.path.abspath(directory), '.matcha', 'tmp')
+        out_dir = preview_dir or os.path.join(directory, '.matcha', 'tmp')
         _previews([i for _, i in cands], preview, [float(b) for b in bpps.split(',')], out_dir, console)
         return
     if not apply:
         for s, i in cands[:20]:
             console.print(escape(f'  {human_size(s):>10}  {i.codec:<6} {i.path}'))
-        console.print('dry run: pass --apply to re-encode (originals are deleted)')
+        console.print('dry run: pass --apply to re-encode' + ('' if keep else ' (originals are deleted)'))
         return
-    if not yes and input(f'Permanently delete {len(cands)} originals? Type yes to continue: ').strip() != 'yes':
+    if not (keep or yes) and input(f'Permanently delete {len(cands)} originals? Type yes to continue: ').strip() != 'yes':
         raise SystemExit('aborted')
     db = os.path.join(directory, '.matcha', 'index.db')
     db_path = db if os.path.exists(db) else None
@@ -253,7 +267,8 @@ def run_reencode(
         fold_in_moved_paths(db_path)  # videos from the old `move` command sit at moved_to, not path
     saved = done = 0
     for _, i in track(cands, description='Re-encoding'):
-        gained, reason = _reencode_one(i, db_path, bpp, preset)
+        held = os.path.join(keep, os.path.relpath(i.path, directory)) if keep else None
+        gained, reason = _reencode_one(i, db_path, bpp, preset, held)
         saved += gained
         done += bool(gained)
         if reason:
