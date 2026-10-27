@@ -4,8 +4,10 @@
 import os, pytest, shutil, subprocess
 from dataclasses import replace
 from pathlib import Path
+from typer.testing import CliRunner
 
 from matcha import reencode
+from matcha.cli import app
 from matcha.reencode import Info, _info, _candidates, _videos, run_reencode
 from matcha.review.media import Probe
 
@@ -85,3 +87,7 @@ def test_info_is_none_for_missing_file_failed_probe_or_no_video(tmp_path, monkey
     assert _info(str(f)) is None
     monkeypatch.setattr(reencode, 'probe', lambda path: Probe(None, None, None, 100))
     assert _info(str(f)) is None
+
+def test_reencode_command_reports_an_empty_directory(tmp_path):
+    result = CliRunner().invoke(app, ['reencode', str(tmp_path)])
+    assert result.exit_code == 0 and 'no videos found' in result.output
