@@ -18,11 +18,13 @@
 # Matcha
 Matcha is a CLI tool for finding duplicate and near-duplicate videos in a directory, including sub-clip detection across different qualities and lengths. It can be installed using the Python `uv` package manager as described in [Installation](#installation).
 
-Matcha provides several subcommands:
+Matcha provides several subcommands. `review` (browser) and `plan` + `apply` (terminal) are two ways of acting on the matches once `match` has run:
 ```sh
 matcha index    <directory>            Fingerprint all videos and populate the index
 matcha match    <directory>            Compare indexed videos and record matches
 matcha review   <directory>            Open a browser UI to review duplicate groups, then delete, rename or dismiss
+matcha plan     <directory>            Step through duplicate groups in the terminal and write a review plan
+matcha apply    <directory>            Apply a review plan: delete and rename files and update the index (dry run by default)
 matcha continue [directory] [command]  Re-run the last index or match command with the same configuration
 ```
 
@@ -43,11 +45,13 @@ For more information on using the subcommands, see the relevant section of [Subc
 - `numpy`
 - `Pillow`
 - `pyacoustid`
+- `questionary`
+- `rich`
 - `send2trash`
 - `streamlit`
 - `tqdm`
 - `typer`
-These can be installed using: `uv add faiss-cpu imagehash numpy Pillow pyacoustid send2trash streamlit tqdm typer`.
+These can be installed using: `uv add faiss-cpu imagehash numpy Pillow pyacoustid questionary rich send2trash streamlit tqdm typer`.
 
 ### Installation
 Matcha can be downloaded from this repository using: `git clone https://github.com/holsam/Matcha.git`.
@@ -164,6 +168,76 @@ Thumbnails are generated on first view and cached in `.matcha/thumbs/`. Librarie
 
 The grouping uses union-find, which processes each pair in O(α(n)) time (effectively constant), so even a large match table resolves instantly.
 
+
+### `matcha plan`
+#### CLI options and usage
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--min-confidence` | `0.8` | Minimum match confidence to group on |
+| `--threshold` | `10` | Max Hamming distance per frame when locating subclips (as in `match`) |
+| `--no-pause` | off | Print every group without prompting; reads and writes no plan |
+| `--plan` | `.matcha/review_plan.json` | Plan file to write and resume from |
+| `--restart` | off | Ignore any existing plan and start again |
+
+```sh
+# Step through groups, largest potential saving first
+uv run matcha plan /path/to/Videos
+
+# Preview every group without deciding anything
+uv run matcha plan /path/to/Videos --no-pause
+
+# Throw away earlier decisions and begin again
+uv run matcha plan /path/to/Videos --restart
+```
+#### Explanation
+Shows one duplicate group at a time (the same groups as `review`, dismissed matches excluded), ordered by how much space each could free. Each group is drawn as a timeline against the longest file, with duration, resolution, codec, bitrate and size per file. Subclips are placed at the offset where they best align with the source.
+
+- **Recommended keep:** among the full-length files (at least 95% of the longest), the one with the best quality, judged by pixels weighted by how well the bitrate feeds them and by codec efficiency, with file size as the tiebreak. It starts ticked. If the top files are indistinguishable, nothing is pre-ticked.
+- **Your choice:** tick the files to keep (space toggles, Enter confirms). Anything unticked is marked for deletion. Each kept file then prompts for a name, defaulting to its current one, so a changed name becomes a rename. Subclips are never the recommended keep, so they start unticked: tick any you want to keep, or they are marked for deletion like the other unticked files. The saving figure shown for a group counts full-length duplicates only.
+- **Ctrl-C** ends the session. Groups decided so far are already saved.
+
+`plan` never touches your files or the index. It only writes the plan, atomically after every group, so an interrupted session resumes at the first undecided group. Groups are keyed by their video ids, so decisions stay valid across runs.
+
+### `matcha apply`
+#### CLI options and usage
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--plan` | `.matcha/review_plan.json` | Plan file to apply |
+| `--apply` | off | Make the changes. Without it, `apply` is a dry run |
+| `--yes` | off | Skip the confirmation prompt |
+| `--quiet` | off | Only print the summary and failures |
+
+```sh
+# Dry run: show what would happen
+uv run matcha apply /path/to/Videos
+
+# Do it (asks for confirmation)
+uv run matcha apply /path/to/Videos --apply
+```
+#### Explanation
+Carries out a plan group by group, keeping the index consistent with the disk:
+
+1. **Deletes first**, so a freed file name can be reused by a rename. The file is removed, then its rows are purged from every table. The database step only runs once the file step succeeded.
+2. **Renames**: the file is renamed, then `videos.path` is updated. If the update fails the rename is undone.
+3. **Dismissal:** when two or more files in a group survive, the matches between them are marked dismissed so the group does not come back.
+
+Safety checks:
+- It never deletes the last copy: if no surviving file in a group exists on disk, the group's deletes are skipped.
+- A file whose stored path differs from the plan is skipped as stale.
+- Every step is recorded in the plan as it completes, so an interrupted run can be re-run and picks up where it stopped.
+- A dry run is the default, and `--apply` asks you to type `yes` unless `--yes` is given.
+
+**Deletes are permanent** (`os.remove`), unlike `review`, which sends files to the OS trash. Stop `index`, `match` and `review` while applying.
+
+#### Plan then apply
+```sh
+matcha index  /path/to/Videos
+matcha match  /path/to/Videos
+matcha plan   /path/to/Videos            # decide group by group, Ctrl-C any time
+matcha apply  /path/to/Videos            # dry run: check the summary
+matcha apply  /path/to/Videos --apply    # make the changes
+```
+Separating the decisions from the file changes lets you review a whole library over several sittings, inspect the plan (`.matcha/review_plan.json`) before anything is touched, and re-run `apply` safely after a failure.
 
 ### `matcha continue`
 #### CLI options and usage

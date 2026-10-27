@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from send2trash import send2trash
 
 # Import internal matcha objects
-from matcha.db import delete_video_record, get_connection, init_schema
+from matcha.db import delete_video_record, dismiss_matches, get_connection, init_schema
 
 
 # DeleteResult: which ids were removed and why any were not
@@ -88,14 +88,7 @@ def rename_video(directory: str, video_id: int, new_name: str) -> str:
 # dismiss_group: mark every match inside the group as not-duplicates so it stops showing
 def dismiss_group(directory: str, video_ids: list[int]) -> int:
     _, db_path = _paths(directory)
-    conn = get_connection(db_path)
-    marks = ','.join('?' * len(video_ids))
-    with conn:
-        cur = conn.execute(
-            f'UPDATE matches SET dismissed = 1 WHERE video_a_id IN ({marks}) AND video_b_id IN ({marks})',
-            [*video_ids, *video_ids],
-        )
-    return cur.rowcount
+    return dismiss_matches(get_connection(db_path), video_ids)
 
 
 # MissingFile: an indexed video whose file is no longer on disk

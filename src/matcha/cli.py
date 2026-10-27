@@ -1,15 +1,17 @@
 import os, subprocess, sys
 import typer
 
+from matcha.apply import run as run_apply
 from matcha.continuer import run_continue
 from matcha.db import fold_in_moved_paths, init_schema
+from matcha.plan import run_plan
 from matcha.indexer import run_index
 from matcha.matcher import run_match
 
 app = typer.Typer(help="Matcha — a video matching tool using perceptual hashing.")
 
 
-@app.command()
+@app.command(rich_help_panel="Identify matches")
 def index(
     directory: str = typer.Argument(..., help="Directory to index."),
     fps: float = typer.Option(1.0, help="Frames per second to sample for hashing."),
@@ -22,7 +24,7 @@ def index(
     run_index(directory, fps=fps, workers=workers, no_audio=no_audio, hwaccel=hwaccel, reuse_duplicates=reuse_duplicates)
 
 
-@app.command()
+@app.command(rich_help_panel="Identify matches")
 def match(
     directory: str = typer.Argument(..., help="Directory to match."),
     filter_length: bool = typer.Option(False, "--filter-length", help="Only compare pairs where one video is strictly longer than the other."),
@@ -49,7 +51,7 @@ def match(
 
 
 
-@app.command()
+@app.command(rich_help_panel="Review matches")
 def review(
     directory: str = typer.Argument(..., help="Directory to review."),
     port: int = typer.Option(8501, help="Port to serve the review UI on."),
@@ -71,8 +73,31 @@ def review(
         check=False,
     )
 
+@app.command(rich_help_panel="Review matches")
+def plan(
+    directory: str = typer.Argument(..., help="Directory containing .matcha/index.db."),
+    min_confidence: float = typer.Option(0.8, help="Minimum match confidence to group on."),
+    threshold: int = typer.Option(10, help="Max Hamming distance per frame, as used by `matcha match`."),
+    no_pause: bool = typer.Option(False, "--no-pause", help="Print every group without waiting for input."),
+    plan: str | None = typer.Option(None, "--plan", help="Plan file to write and resume from."),
+    restart: bool = typer.Option(False, "--restart", help="Ignore any existing plan and start again."),
+):
+    """Step through duplicate groups in the terminal and write a review plan."""
+    run_plan(directory, min_confidence=min_confidence, threshold=threshold, no_pause=no_pause, plan=plan, restart=restart)
 
-@app.command()
+@app.command(name="apply", rich_help_panel="Review matches")
+def apply_(
+    directory: str = typer.Argument(..., help="Directory containing .matcha/index.db."),
+    plan: str | None = typer.Option(None, "--plan", help="Plan file (default: .matcha/review_plan.json)."),
+    execute: bool = typer.Option(False, "--apply", help="Make the changes (default is a dry run)."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
+    quiet: bool = typer.Option(False, "--quiet", help="Only print the summary and failures."),
+):
+    """Apply a review plan: delete, rename and update the index db."""
+    raise SystemExit(run_apply(directory, plan, apply=execute, yes=yes, quiet=quiet))
+
+
+@app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(
     directory: str = typer.Argument(".", help="Directory to continue from.",),
     command: str | None = typer.Argument(None, help="Command to continue: 'index' or 'match'.",),
