@@ -104,6 +104,9 @@ def reencode(
     min_saving_pct: float = typer.Option(30.0, help="Minimum estimated saving per file, in percent."),
     min_saving_mb: float = typer.Option(50.0, help="Minimum estimated saving per file, in MB."),
     probe_workers: int = typer.Option(4, help="Number of parallel ffprobe workers."),
+    preview: int = typer.Option(0, help="Build side-by-side comparison clips for N random candidates and stop."),
+    bpps: str = typer.Option("0.03,0.06,0.10", help="Comma separated bpp values to compare with --preview."),
+    preview_dir: str | None = typer.Option(None, "--preview-dir", help="Where --preview writes (default: .matcha/tmp)."),
 ):
     """Profile videos by codec and bitrate and estimate the space re-encoding to HEVC would save."""
     run_reencode(
@@ -112,6 +115,9 @@ def reencode(
         min_saving_pct=min_saving_pct,
         min_saving_mb=min_saving_mb,
         probe_workers=probe_workers,
+        preview=preview,
+        bpps=bpps,
+        preview_dir=preview_dir,
     )
 
 @app.command(name="continue", rich_help_panel="Identify matches")

@@ -3,10 +3,11 @@ MATCHA: profile a library by codec and bitrate, and re-encode bloated videos to 
 '''
 
 # Import external dependencies
-import os
+import os, random, subprocess
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from PIL import Image, ImageDraw, ImageFont
 from rich.console import Console
 from rich.markup import escape
 from rich.progress import track
@@ -107,7 +108,50 @@ def _report(infos: list[Info], savings: dict[str, int], bpp: float, console: Con
     console.print(f'{len(bloated)} bloated files (>{_BLOAT}x the bpp their codec needs), '
                   f'{human_size(sum(savings[i.path] for i in bloated))} of the estimate')
 
-# run_reencode: profile the library and list the files worth re-encoding, without touching anything
+# _ffmpeg: run ffmpeg quietly, overwriting outputs, raising on failure
+def _ffmpeg(args: list[str]) -> None:
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', *args], check=True)
+
+# _label: render a caption PNG, as ffmpeg builds often lack drawtext
+def _label(text: str, path: str) -> None:
+    font = ImageFont.load_default(size=22)
+    img = Image.new('RGB', (int(font.getlength(text)) + 16, 36), 'black')
+    ImageDraw.Draw(img).text((8, 5), text, fill='white', font=font)
+    img.save(path)
+
+# _preview: cut a 10s clip, re-encode it at each bpp, stitch original and encodes side by side, return the output path
+def _preview(i: Info, bpps: list[float], out_dir: str, n: int) -> str:
+    stem = f'{n:02d}_{os.path.splitext(os.path.basename(i.path))[0]}'[:60]
+    clip = os.path.join(out_dir, f'{stem}_orig.mkv')
+    _ffmpeg(['-ss', str(max(0, i.duration / 2 - 5)), '-i', i.path, '-t', '10', '-map', '0:v:0', '-c', 'copy', clip])
+    panels = [(clip, f'original ({i.vbitrate / 1e6:.1f} Mbps, {i.codec})')]
+    for bpp in bpps:
+        rate = int(i.width * i.height * i.fps * bpp)
+        enc = os.path.join(out_dir, f'{stem}_{bpp}.mp4')
+        _ffmpeg(['-i', clip, '-c:v', 'libx265', '-tag:v', 'hvc1', '-x265-params', 'log-level=error',
+                 '-b:v', str(rate), '-an', enc])
+        panels.append((enc, f'{bpp} bpp ({rate / 1e6:.1f} Mbps, hevc)'))
+    inputs: list[str] = []
+    graph = []
+    for k, (path, text) in enumerate(panels):
+        png = os.path.join(out_dir, f'{stem}_label{k}.png')
+        _label(text, png)
+        inputs += ['-i', path, '-i', png]
+        graph.append(f'[{2 * k}:v]scale=-2:360,setsar=1[v{k}];[v{k}][{2 * k + 1}:v]overlay=0:0[p{k}]')
+    graph.append(''.join(f'[p{k}]' for k in range(len(panels))) + f'hstack=inputs={len(panels)}[out]')
+    out = os.path.join(out_dir, f'{stem}_compare.mp4')
+    _ffmpeg([*inputs, '-filter_complex', ';'.join(graph), '-map', '[out]', '-c:v', 'libx264', '-crf', '18', '-an', out])
+    return out
+
+# _previews: build a comparison clip for n random candidates and print where they are
+def _previews(cands: list[Info], n: int, bpps: list[float], out_dir: str, console: Console) -> None:
+    pool = [i for i in cands if i.duration > 1]
+    os.makedirs(out_dir, exist_ok=True)
+    picks = random.sample(pool, min(n, len(pool)))
+    outs = [_preview(i, bpps, out_dir, k) for k, i in enumerate(track(picks, description='Previewing'))]
+    console.print('\n'.join(['Previews:', *(os.path.abspath(o) for o in outs)]))
+
+# run_reencode: profile the library, then optionally build preview clips
 def run_reencode(
     directory: str,
     *,
@@ -115,6 +159,9 @@ def run_reencode(
     min_saving_pct: float = 30.0,
     min_saving_mb: float = 50.0,
     probe_workers: int = 4,
+    preview: int = 0,
+    bpps: str = '0.03,0.06,0.10',
+    preview_dir: str | None = None,
 ) -> None:
     console = Console()
     paths = _videos(directory)
@@ -128,5 +175,9 @@ def run_reencode(
     cands = _candidates(infos, bpp, min_saving_pct=min_saving_pct, min_saving_mb=min_saving_mb)
     est = sum(s for s, _ in cands)
     console.print(f'{len(cands)} of {len(infos)} files qualify, est. saving [bold green]{human_size(est)}[/] at {bpp} bpp')
+    if preview:
+        out_dir = preview_dir or os.path.join(os.path.abspath(directory), '.matcha', 'tmp')
+        _previews([i for _, i in cands], preview, [float(b) for b in bpps.split(',')], out_dir, console)
+        return
     for s, i in cands[:20]:
         console.print(escape(f'  {human_size(s):>10}  {i.codec:<6} {i.path}'))

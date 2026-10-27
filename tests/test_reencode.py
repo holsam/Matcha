@@ -4,12 +4,13 @@
 import os, pytest, shutil, subprocess
 from dataclasses import replace
 from pathlib import Path
+from PIL import Image
 from typer.testing import CliRunner
 
 from matcha import reencode
 from matcha.cli import app
-from matcha.reencode import Info, _info, _candidates, _videos, run_reencode
-from matcha.review.media import Probe
+from matcha.reencode import Info, _info, _candidates, _label, _preview, _videos, run_reencode
+from matcha.review.media import Probe, probe
 
 # H264: 1080p30 at 8 Mbps for 100 s, about 0.13 bpp
 H264 = Info('a.mp4', 105_000_000, 100.0, 1920, 1080, 30.0, 'h264', 8_000_000)
@@ -91,3 +92,24 @@ def test_info_is_none_for_missing_file_failed_probe_or_no_video(tmp_path, monkey
 def test_reencode_command_reports_an_empty_directory(tmp_path):
     result = CliRunner().invoke(app, ['reencode', str(tmp_path)])
     assert result.exit_code == 0 and 'no videos found' in result.output
+
+@needs_ffmpeg
+def test_label_height(tmp_path):
+    _label('0.06 bpp (1.0 Mbps, hevc)', str(tmp_path / 'l.png'))
+    assert Image.open(tmp_path / 'l.png').height == 36
+
+
+@needs_ffmpeg
+def test_preview_stitches_original_and_encodes_side_by_side(tmp_path):
+    info = _info(str(make_clip(tmp_path / 'a.mp4')))
+    out = probe(_preview(info, [0.06], str(tmp_path), 0))
+    assert (out.width, out.height) == (2 * 480, 360)  # two panels scaled to 360 high
+
+
+@needs_ffmpeg
+def test_preview_flag_writes_comparisons_and_touches_no_originals(tmp_path):
+    clip = make_clip(tmp_path / 'a.mp4')
+    before = clip.read_bytes()
+    run_reencode(str(tmp_path), min_saving_mb=0, min_saving_pct=0, preview=1, bpps='0.06')
+    assert len(list((tmp_path / '.matcha' / 'tmp').glob('*_compare.mp4'))) == 1
+    assert clip.read_bytes() == before
