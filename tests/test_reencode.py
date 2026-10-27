@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 from matcha import reencode
 from matcha.cli import app
 from matcha.db import get_connection, init_schema
-from matcha.reencode import Info, _info, _candidates, _label, _preview, _verify, _videos, run_reencode
+from matcha.reencode import Info, _info, _candidates, _label, _precheck, _preview, _verify, _videos, run_reencode
 from matcha.review.media import Probe, probe
 
 # H264: 1080p30 at 8 Mbps for 100 s, about 0.13 bpp
@@ -192,3 +192,36 @@ def test_keep_dir_inside_the_library_is_not_profiled(tmp_path):
     before = (keep / 'a.mp4').read_bytes()
     run_reencode(str(tmp_path), apply=True, min_saving_mb=0, min_saving_pct=0, preset='ultrafast', keep_originals=str(keep))
     assert (keep / 'a.mp4').read_bytes() == before
+
+@needs_ffmpeg
+def test_existing_target_is_not_overwritten(tmp_path):
+    avi = make_clip(tmp_path / 'a.avi', '-c:v', 'mpeg4', '-q:v', '2')
+    (tmp_path / 'a.mkv').write_bytes(b'x')  # unreadable, so not a candidate itself
+    before = avi.read_bytes()
+    apply(tmp_path)
+    assert avi.read_bytes() == before
+    assert (tmp_path / 'a.mkv').read_bytes() == b'x'
+
+@needs_ffmpeg
+def test_existing_held_original_skips_the_file(tmp_path):
+    lib, keep = tmp_path / 'lib', tmp_path / 'keep'
+    lib.mkdir()
+    keep.mkdir()
+    clip = make_clip(lib / 'a.mp4')
+    (keep / 'a.mp4').write_bytes(b'old')
+    before = clip.read_bytes()
+    run_reencode(str(lib), apply=True, min_saving_mb=0, min_saving_pct=0, preset='ultrafast', keep_originals=str(keep))
+    assert clip.read_bytes() == before
+    assert (keep / 'a.mp4').read_bytes() == b'old'
+
+@needs_ffmpeg
+def test_precheck_skips_files_with_several_video_streams(tmp_path):
+    one = make_clip(tmp_path / 'one.mkv')
+    two = tmp_path / 'two.mkv'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(one), '-i', str(one), '-map', '0:v', '-map', '1:v',
+                    '-c', 'copy', str(two)], check=True)
+    assert _precheck(_info(str(one)), str(one), None) is None
+    assert '2 video streams' in _precheck(_info(str(two)), str(two), None)
+    before = two.read_bytes()
+    apply(tmp_path)
+    assert two.read_bytes() == before

@@ -192,7 +192,7 @@ def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str, held: s
     dst = _target(i.path)
     tmp = f'{os.path.splitext(i.path)[0]}.reencoding{os.path.splitext(dst)[1]}'
     try:
-        reason = _encode(i, tmp, bpp, preset) or _verify(i, tmp)
+        reason = _precheck(i, dst, held) or _encode(i, tmp, bpp, preset) or _verify(i, tmp)
         if reason:
             return 0, reason
         saved = i.size - os.path.getsize(tmp)
@@ -219,6 +219,24 @@ def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str, held: s
         if os.path.exists(tmp):
             os.remove(tmp)
 
+# _precheck: why this file must be skipped before any work is done, or None
+def _precheck(i: Info, dst: str, held: str | None) -> str | None:
+    if dst != i.path and os.path.lexists(dst):
+        return f'{dst!r} already exists'
+    if held and os.path.lexists(held):
+        return f'{held!r} already exists in the keep directory'
+    streams = _video_streams(i.path)
+    if streams > 1:
+        return f'{streams} video streams, only the first would be kept'
+    return None
+
+# _video_streams: number of video streams in a file
+def _video_streams(path: str) -> int:
+    out = subprocess.run(
+        ['ffprobe', '-v', 'error', '-select_streams', 'v', '-show_entries', 'stream=index', '-of', 'csv=p=0', path],
+        capture_output=True, text=True,
+    ).stdout
+    return len(out.split())
 
 # run_reencode: profile the library, then optionally build preview clips or re-encode the candidates in place
 def run_reencode(
