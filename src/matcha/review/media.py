@@ -20,7 +20,10 @@ class Probe:
     width: int | None
     height: int | None
     codec: str | None
-    bitrate: int | None
+    bitrate: int | None  # whole file, audio included
+    video_bitrate: int | None = None  # video stream only
+    fps: float | None = None
+    duration: float | None = None
 
 
 # THUMB_WIDTH: pixel width of cached thumbnails
@@ -58,7 +61,7 @@ def human_duration(seconds: float) -> str:
 def probe(path: str) -> Probe | None:
     cmd = [
         'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-        '-show_entries', 'stream=codec_name,width,height:format=bit_rate',
+        '-show_entries', 'stream=codec_name,width,height,bit_rate,avg_frame_rate:format=bit_rate,duration',
         '-of', 'json', path,
     ]
     try:
@@ -67,13 +70,30 @@ def probe(path: str) -> Probe | None:
     except (subprocess.SubprocessError, OSError, ValueError):
         return None
     stream = (data.get('streams') or [{}])[0]
-    bitrate = (data.get('format') or {}).get('bit_rate')
+    fmt = data.get('format') or {}
+    num, _, den = (stream.get('avg_frame_rate') or '0/1').partition('/')
     return Probe(
         stream.get('width'),
         stream.get('height'),
         stream.get('codec_name'),
-        int(bitrate) if bitrate and bitrate.isdigit() else None,
+        _int(fmt.get('bit_rate')),
+        _int(stream.get('bit_rate')),
+        float(num) / float(den) if float(den or 1) else None,
+        _float(fmt.get('duration')),
     )
+
+
+# _int: ffprobe reports numbers as strings, or 'N/A'; None when it is not a plain integer
+def _int(value: str | None) -> int | None:
+    return int(value) if value and value.isdigit() else None
+
+
+# _float: as _int for decimals such as a duration
+def _float(value: str | None) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # thumbnail: path of a cached mid-video frame, generated on first use, or None if ffmpeg cannot read the file

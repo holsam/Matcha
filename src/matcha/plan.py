@@ -3,7 +3,7 @@ MATCHA: step through match groups one at a time with timelines, file details and
 '''
 
 # Import external dependencies
-import json, math, numpy as np, os, questionary, time, sqlite3, subprocess
+import json, math, numpy as np, os, questionary, time, sqlite3
 from dataclasses import dataclass
 from numpy.lib.stride_tricks import sliding_window_view
 from rich.console import Console
@@ -12,6 +12,7 @@ from rich.text import Text
 
 # Import internal matcha objects
 from matcha.groups import build_groups
+from matcha.review.media import probe
 
 # _BAR_WIDTH: widest bar, shrunk on narrow terminals
 _BAR_WIDTH = 50
@@ -67,26 +68,18 @@ def _fmt(n: float) -> str:
         n /= 1024
     return f'{n:.2f} TB'
 
-# _probe: ffprobe one file, None when it is missing or unreadable
+# _probe: stat and ffprobe one file, None when it is missing or unreadable
 def _probe(vid: int, path: str, stored_duration: float) -> Info | None:
     try:
         size = os.path.getsize(path)
-        out = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-print_format', 'json',
-             '-show_entries', 'stream=width,height,codec_name,bit_rate,avg_frame_rate:format=duration,bit_rate', path],
-            capture_output=True, text=True,
-        ).stdout
-        data = json.loads(out)
-    except (OSError, ValueError):
+    except OSError:
         return None
-    stream = (data.get('streams') or [{}])[0]
-    fmt = data.get('format', {})
-    duration = float(fmt.get('duration') or stored_duration or 0)
-    bitrate = int(stream.get('bit_rate') or fmt.get('bit_rate') or (size * 8 / duration if duration else 0))
-    num, _, den = (stream.get('avg_frame_rate') or '0/1').partition('/')
-    fps = float(num) / float(den or 1) if float(den or 1) else 0.0
-    return Info(vid, path, size, duration, int(stream.get('width') or 0), int(stream.get('height') or 0),
-                bitrate, fps or 30.0, stream.get('codec_name') or '?')
+    p = probe(path)
+    if p is None:
+        return None
+    duration = p.duration or stored_duration or 0
+    bitrate = p.video_bitrate or p.bitrate or (size * 8 / duration if duration else 0)
+    return Info(vid, path, size, duration, p.width or 0, p.height or 0, bitrate, p.fps or 30.0, p.codec or '?')
 
 # _quality: pixels scaled by how well the bitrate feeds them, so a starved 1080p can lose to a well fed 720p
 def _quality(i: Info) -> float:

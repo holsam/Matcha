@@ -9,6 +9,7 @@ import json, os, pytest
 from matcha import plan
 from matcha.db import get_connection, init_schema
 from matcha.plan import Info
+from matcha.review.media import Probe
 
 # _info: a probed file, 1080p at a healthy bitrate unless overridden
 def _info(vid: int = 1, **kw) -> Info:
@@ -36,6 +37,43 @@ class TestFormatting:
         assert plan._fmt(1024) == '1.0 KB'
         assert plan._fmt(5 * 1024**3) == '5.0 GB'
         assert plan._fmt(2 * 1024**4) == '2.00 TB'
+
+# TestProbe: Info built from stat plus media.probe
+class TestProbe:
+    # _file: a 1000 byte file on disk
+    @staticmethod
+    def _file(tmp_path) -> str:
+        path = tmp_path / 'a.mp4'
+        path.write_text('x' * 1000)
+        return str(path)
+
+    # test_builds_info: probe facts and file size carried over
+    def test_builds_info(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(plan, 'probe', lambda path: Probe(1280, 720, 'hevc', 2_000_000, 1_500_000, 25.0, 12.5))
+        info = plan._probe(7, self._file(tmp_path), 99.0)
+        assert (info.id, info.size, info.duration) == (7, 1000, 12.5)
+        assert (info.width, info.height, info.codec, info.fps) == (1280, 720, 'hevc', 25.0)
+        assert info.bitrate == 1_500_000  # the video stream beats the whole file
+
+    # test_bitrate_fallbacks: whole file bitrate, then size over duration
+    def test_bitrate_fallbacks(self, tmp_path, monkeypatch):
+        path = self._file(tmp_path)
+        monkeypatch.setattr(plan, 'probe', lambda p: Probe(64, 48, 'h264', 2_000_000, None, 30.0, 10.0))
+        assert plan._probe(1, path, 0).bitrate == 2_000_000
+        monkeypatch.setattr(plan, 'probe', lambda p: Probe(64, 48, 'h264', None, None, 30.0, 10.0))
+        assert plan._probe(1, path, 0).bitrate == 800
+
+    # test_missing_facts_get_defaults: stored duration, 30 fps and '?' codec stand in
+    def test_missing_facts_get_defaults(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(plan, 'probe', lambda path: Probe(None, None, None, None, None, None, None))
+        info = plan._probe(1, self._file(tmp_path), 8.0)
+        assert (info.duration, info.fps, info.codec, info.width, info.height) == (8.0, 30.0, '?', 0, 0)
+
+    # test_unreadable_or_missing: None either way
+    def test_unreadable_or_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(plan, 'probe', lambda path: None)
+        assert plan._probe(1, self._file(tmp_path), 1.0) is None
+        assert plan._probe(1, str(tmp_path / 'nope.mp4'), 1.0) is None
 
 # TestQuality: the keep recommendation inputs
 class TestQuality:
