@@ -159,6 +159,12 @@ def purge_video(conn: sqlite3.Connection, video_id: int) -> int:
 def delete_video_record(db_path: str, video_id: int) -> None:
     purge_video(get_connection(db_path), video_id)
 
+# repoint_video: point a video's row at a new path and clear content_key, which hashes the old file's size
+def repoint_video(db_path: str, old_path: str, new_path: str) -> None:
+    conn = get_connection(db_path)
+    with conn:
+        conn.execute('UPDATE videos SET path = ?, content_key = NULL WHERE path = ?', (new_path, old_path))
+
 # dismiss_matches: mark every match among the given videos as not-duplicates, returning the matches marked
 def dismiss_matches(conn: sqlite3.Connection, video_ids: list[int]) -> int:
     marks = ','.join('?' * len(video_ids))

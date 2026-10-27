@@ -7,6 +7,7 @@ from matcha.db import fold_in_moved_paths, init_schema
 from matcha.plan import run_plan
 from matcha.indexer import run_index
 from matcha.matcher import run_match
+from matcha.reencode import run_reencode
 
 app = typer.Typer(help="Matcha — a video matching tool using perceptual hashing.")
 
@@ -96,6 +97,36 @@ def apply_(
     """Apply a review plan: delete, rename and update the index db."""
     raise SystemExit(run_apply(directory, plan, apply=execute, yes=yes, quiet=quiet))
 
+@app.command(rich_help_panel="Additional utilities")
+def reencode(
+    directory: str = typer.Argument(..., help="Directory of videos to profile or re-encode."),
+    bpp: float = typer.Option(0.06, help="Target bits per pixel per frame (HEVC): ~0.04 aggressive, 0.06 balanced, 0.10 high quality."),
+    min_saving_pct: float = typer.Option(30.0, help="Minimum estimated saving per file, in percent."),
+    min_saving_mb: float = typer.Option(50.0, help="Minimum estimated saving per file, in MB."),
+    probe_workers: int = typer.Option(4, help="Number of parallel ffprobe workers."),
+    preview: int = typer.Option(0, help="Build side-by-side comparison clips for N random candidates and stop."),
+    bpps: str = typer.Option("0.03,0.06,0.10", help="Comma separated bpp values to compare with --preview."),
+    preview_dir: str | None = typer.Option(None, "--preview-dir", help="Where --preview writes (default: .matcha/tmp)."),
+    execute: bool = typer.Option(False, "--apply", help="Re-encode the candidates in place (default is a dry run)."),
+    preset: str = typer.Option("medium", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
+    keep_originals: str | None = typer.Option(None, "--keep-originals", help="Move originals here, with a symlink to each new file, instead of deleting."),
+):
+    """Profile videos by codec and bitrate, and re-encode bloated ones to HEVC."""
+    run_reencode(
+        directory,
+        bpp=bpp,
+        min_saving_pct=min_saving_pct,
+        min_saving_mb=min_saving_mb,
+        probe_workers=probe_workers,
+        preview=preview,
+        bpps=bpps,
+        preview_dir=preview_dir,
+        apply=execute,
+        preset=preset,
+        yes=yes,
+        keep_originals=keep_originals,
+    )
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(

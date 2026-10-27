@@ -26,6 +26,8 @@ matcha review   <directory>            Open a browser UI to review duplicate gro
 matcha plan     <directory>            Step through duplicate groups in the terminal and write a review plan
 matcha apply    <directory>            Apply a review plan: delete and rename files and update the index (dry run by default)
 matcha continue [directory] [command]  Re-run the last index or match command with the same configuration
+matcha reencode <directory>            Profile videos by codec and bitrate and re-encode bloated ones to HEVC (dry run by default)
+
 ```
 
 All subcommands are checkpointed — if interrupted, they pick up where they left off on the next run. However `continue` is provided as a utility to continue the last `index` and `match` commands, and will continue using the same parameters as previously used. 
@@ -238,6 +240,39 @@ matcha apply  /path/to/Videos            # dry run: check the summary
 matcha apply  /path/to/Videos --apply    # make the changes
 ```
 Separating the decisions from the file changes lets you review a whole library over several sittings, inspect the plan (`.matcha/review_plan.json`) before anything is touched, and re-run `apply` safely after a failure.
+
+### `matcha reencode`
+#### CLI options and usage
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bpp` | `0.06` | Target bits per pixel per frame for HEVC. About 0.04 is aggressive, 0.06 balanced, 0.10 high quality |
+| `--min-saving-pct` | `30` | Skip files whose estimated saving is below this percentage of their size |
+| `--min-saving-mb` | `50` | Skip files whose estimated saving is below this many MB |
+| `--probe-workers` | `4` | Parallel ffprobe workers |
+| `--preview` | `0` | Build side-by-side comparison clips for N random candidates, then stop |
+| `--bpps` | `0.03,0.06,0.10` | bpp values to compare with `--preview` |
+| `--preview-dir` | `.matcha/tmp` | Where `--preview` writes |
+| `--apply` | off | Re-encode in place. Without it, `reencode` is a dry run |
+| `--preset` | `medium` | x265 preset, `ultrafast` to `veryslow`. Faster presets give larger files |
+| `--yes` | off | Skip the confirmation prompt |
+| `--keep-originals` | none | Move originals to this directory, with a symlink to each new file, instead of deleting them |
+
+```sh
+# Profile the library and list the biggest savings
+uv run matcha reencode /path/to/Videos
+
+# Check what 0.03, 0.06 and 0.10 bpp look like on three random candidates
+uv run matcha reencode /path/to/Videos --preview 3
+
+# Re-encode, keeping the originals until you have checked the results
+uv run matcha reencode /path/to/Videos --apply --keep-originals /path/to/Held
+```
+#### Explanation
+Estimates how much space re-encoding to HEVC would save from each file's bits per pixel per frame (bpp), a measure of bitrate that does not depend on resolution or frame rate. Each codec needs a different bpp for the same look, so a file's bloat is its bpp as a multiple of what its own codec needs at the target. This is a heuristic, not a trial encode: use `--preview` to judge quality before applying.
+
+With `--apply`, each candidate is encoded beside the original, checked (HEVC, same duration within a second, at least 10% smaller), then swapped in. Audio and subtitles are copied. Files in a container that cannot hold HEVC (avi, wmv, flv, webm) become `.mkv`, and the index is updated to match. Files are skipped, with a reason, when the encode or check fails, when the new name is already taken, or when the file has more than one video stream.
+
+**The original is deleted** once the new file verifies, unless `--keep-originals` is given. Stop `index`, `match` and `review` while applying.
 
 ### `matcha continue`
 #### CLI options and usage
