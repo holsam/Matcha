@@ -560,7 +560,7 @@ wheels = [
 
 [[package]]
 name = "matcha"
-version = "3.1.0"
+version = "4.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "faiss-cpu" },
