@@ -67,21 +67,6 @@ class TestQuality:
         assert plan._identical(_info(1)) != plan._identical(_info(2, size=101))
         assert plan._identical(_info(1, duration=10.01)) == plan._identical(_info(2, duration=10.04))
 
-# TestBuildGroups: connected components of the match graph
-class TestBuildGroups:
-    # test_empty: no pairs, no groups
-    def test_empty(self):
-        assert plan._build_groups([]) == []
-
-    # test_chain_merges: a-b and b-c form one group
-    def test_chain_merges(self):
-        assert plan._build_groups([(1, 2), (2, 3)]) == [{1, 2, 3}]
-
-    # test_separate_components: disjoint pairs stay apart
-    def test_separate_components(self):
-        groups = plan._build_groups([(1, 2), (3, 4), (2, 5)])
-        assert sorted(sorted(g) for g in groups) == [[1, 2, 5], [3, 4]]
-
 # TestBar: one diagram row
 class TestBar:
     # test_width_is_constant: every row lines up

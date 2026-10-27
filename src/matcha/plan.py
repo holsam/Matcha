@@ -10,6 +10,9 @@ from rich.console import Console
 from rich.progress import track
 from rich.text import Text
 
+# Import internal matcha objects
+from matcha.groups import build_groups
+
 # _BAR_WIDTH: widest bar, shrunk on narrow terminals
 _BAR_WIDTH = 50
 
@@ -100,24 +103,6 @@ def _score(i: Info) -> tuple[float, int]:
 # _identical: files indistinguishable on everything shown, so no basis to prefer one
 def _identical(i: Info) -> tuple:
     return (i.width, i.height, i.codec, i.bitrate, i.size, round(i.duration, 1))
-
-# _build_groups: connected components of the match graph (union-find, mirrors matcha.groups)
-def _build_groups(pairs: list[tuple[int, int]]) -> list[set[int]]:
-    parent: dict[int, int] = {}
-
-    def find(x: int) -> int:
-        parent.setdefault(x, x)
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]  # path halving
-            x = parent[x]
-        return x
-
-    for a, b in pairs:
-        parent[find(b)] = find(a)
-    groups: dict[int, set[int]] = {}
-    for x in list(parent):
-        groups.setdefault(find(x), set()).add(x)
-    return list(groups.values())
 
 # _hashes: (timestamps, uint64 phashes) for one video
 def _hashes(conn: sqlite3.Connection, video_id: int) -> tuple[np.ndarray, np.ndarray]:
@@ -244,7 +229,7 @@ def run_plan(directory, *, min_confidence=0.8, threshold=10, no_pause=False, pla
         longest = max((videos[v][1] for v in present), default=0)
         sizes = sorted((os.path.getsize(videos[v][0]) for v in present if videos[v][1] >= _FULL_RATIO * longest), reverse=True)
         return sum(sizes[1:])
-    groups = sorted(track(_build_groups(pairs), description='Sizing groups'), key=estimate, reverse=True)
+    groups = sorted(track(build_groups(pairs), description='Sizing groups'), key=estimate, reverse=True)
 
     plan_path = plan or os.path.join(os.path.abspath(directory), '.matcha', 'review_plan.json')
     plan = {} if restart or no_pause else _load_plan(plan_path)  # --no-pause decides nothing, so never touches the plan
