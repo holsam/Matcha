@@ -254,9 +254,11 @@ Separating the decisions from the file changes lets you review a whole library o
 | `--bpps` | `0.03,0.06,0.10` | bpp values to compare with `--preview` |
 | `--preview-dir` | `.matcha/tmp` | Where `--preview` writes |
 | `--apply` | off | Re-encode in place. Without it, `reencode` is a dry run |
-| `--preset` | `medium` | x265 preset, `ultrafast` to `veryslow`. Faster presets give larger files |
+| `--preset` | `fast` | x265 preset, `ultrafast` to `veryslow`. Faster presets give larger files |
 | `--yes` | off | Skip the confirmation prompt |
 | `--keep-originals` | none | Move originals to this directory, with a symlink to each new file, instead of deleting them |
+| `--verbose` | off | Print each ffmpeg command above the progress display |
+| `--encoder` | `x265` | `x265` (software, best quality per bit) or `videotoolbox` (Apple hardware, much faster, larger files; `--preset` is ignored) |
 
 ```sh
 # Profile the library and list the biggest savings
@@ -321,8 +323,10 @@ Takes a video path. Saves a frame with the crop box drawn in red to `.matcha/tmp
 |--------|---------|-------------|
 | `--min-confidence` | `0.0` | Only crop videos where at least this share of frames agreed |
 | `--only` | none | Only crop videos whose path (relative to the directory) matches this glob |
-| `--preset` | `medium` | x265 preset, `ultrafast` to `veryslow` |
+| `--preset` | `fast` | x265 preset, `ultrafast` to `veryslow` |
 | `--keep-originals` | none | Move originals to this directory, with a symlink to each new file, instead of deleting them |
+| `--verbose` | off | Print each ffmpeg command above the progress display |
+| `--encoder` | `x265` | `x265` (software, best quality per bit) or `videotoolbox` (Apple hardware, much faster, larger files; `--preset` is ignored) |
 
 ```sh
 # Look at what would be cropped, then crop it
@@ -340,6 +344,8 @@ Results are kept in `.matcha/borders.json`, separate from the index, and saved a
 `apply` crops each stored `border` video in place and re-encodes it to HEVC at the source's bits per pixel, adjusted for the codec. It uses the same encode, check and swap steps as `reencode`: audio and subtitles are copied, containers that cannot hold HEVC become `.mkv`, and the index is updated. The result is checked for HEVC, the same duration and the exact cropped size. Videos changed since the scan are skipped. After cropping, the store entry becomes `no border` with an `applied` record.
 
 **There is no dry run, and the original is deleted** once the new file verifies, unless `--keep-originals` is given. Use `list` and `preview` first. Keep the `--keep-originals` directory outside the scanned directory, or a later `scan` will flag the held originals again.
+
+Crops whose widest margin is 2 px or less are skipped, as they save too little to justify a re-encode.
 
 ### `matcha continue`
 #### CLI options and usage

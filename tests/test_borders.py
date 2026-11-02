@@ -661,7 +661,7 @@ def test_apply_keep_originals(tmp_path):
 # stub_crop: replace _crop_one, records the paths it is asked to crop
 def stub_crop(monkeypatch, reason=''):
     asked: list[str] = []
-    def fake(path, crop, preset, held, db_path):
+    def fake(path, crop, preset, held, db_path, watch=None, encoder='x265'):
         asked.append(os.path.basename(path))
         return path, (10, 5), reason
     monkeypatch.setattr(borders, '_crop_one', fake)
@@ -711,7 +711,7 @@ def test_apply_nothing_to_do(tmp_path, capsys):
     assert 'Nothing to crop' in capsys.readouterr().out
 
 @needs_ffmpeg
-@pytest.mark.parametrize('crop', [Crop(3, 0, 0, 0), Crop(0, 1, 0, 0), Crop(0, 0, 0, 1), Crop(0, 0, 0, 641), Crop(0, 359, 0, 0)])
+@pytest.mark.parametrize('crop', [Crop(3, 0, 0, 0), Crop(0, 5, 0, 0), Crop(0, 0, 0, 5), Crop(0, 0, 0, 641), Crop(0, 359, 0, 0)])
 def test_crop_one_refuses_bad_boxes(tmp_path, crop):
     video = clip(tmp_path / 'a.mp4')  # 640x360, no border
     _, _, reason = borders._crop_one(str(video), crop, 'ultrafast', None, None)
@@ -723,3 +723,11 @@ def test_cli_apply(tmp_path, monkeypatch):
     asked = stub_crop(monkeypatch)
     r = CliRunner().invoke(app, ['borders', 'apply', str(tmp_path), '--only', 'a*', '--preset', 'ultrafast'])
     assert r.exit_code == 0 and asked == ['a.mp4']
+
+def test_crop_one_skips_margins_not_worth_a_reencode(tmp_path):
+    path, size, reason = borders._crop_one(str(tmp_path / 'missing.mp4'), Crop(2, 0, 0, 1), 'ultrafast', None, None)
+    assert (path, size) == (str(tmp_path / 'missing.mp4'), (0, 0))
+    assert reason == 'widest margin is 2 px, not worth a re-encode'
+
+def test_crop_one_does_not_skip_a_wider_margin(tmp_path):
+    assert borders._crop_one(str(tmp_path / 'missing.mp4'), Crop(4, 0, 0, 0), 'ultrafast', None, None)[2] == 'unreadable'

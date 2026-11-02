@@ -3,26 +3,33 @@ MATCHA: profile a library by codec and bitrate, and re-encode bloated videos to 
 '''
 
 # Import external dependencies
-import os, random, shutil, subprocess
+import os, random, shlex, shutil, subprocess, tempfile, time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Callable
 from PIL import Image, ImageDraw, ImageFont
 from rich.console import Console
 from rich.markup import escape
-from rich.progress import track
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TaskProgressColumn, TextColumn, TimeRemainingColumn, track
 from rich.table import Table
 
 # Import internal matcha objects
 from matcha.db import fold_in_moved_paths, repoint_video
 from matcha.indexer import find_videos
-from matcha.review.media import human_size, probe
+from matcha.review.media import human_duration, human_size, probe
 
 # _HEVC_OK: containers that hold HEVC and keep their extension, anything else becomes mkv
 _HEVC_OK = {'.mp4', '.mkv', '.mov'}
 
 # _APPLE_TAG: containers that need the hvc1 tag for Apple players
 _APPLE_TAG = {'.mp4', '.mov'}
+
+# _ENCODERS: HEVC encoders --encoder accepts, x265 is software and videotoolbox is Apple's hardware encoder
+_ENCODERS = ('x265', 'videotoolbox')
+
+# _VT_RATE_SCALE: videotoolbox needs more bits than x265 for the same quality, so its bitrate is scaled up by this
+_VT_RATE_SCALE = 1.2
 
 # _BLOAT: a file is reported as bloated above this multiple of the bpp its codec needs
 _BLOAT = 1.5
@@ -164,17 +171,89 @@ def _target(path: str) -> str:
     root, ext = os.path.splitext(path)
     return path if ext.lower() in _HEVC_OK else root + '.mkv'
 
+# Watch: optional hooks into a running encode
+@dataclass(frozen=True)
+class Watch:
+    on_progress: Callable[[float, float, float, str], None] | None = None  # seconds done, total seconds, fps, speed
+    echo: Callable[[str], None] | None = None  # receives the ffmpeg command line
+
+# _parse_block: one ffmpeg -progress block as (seconds encoded, fps, speed), None before the first frame is out
+def _parse_block(block: dict[str, str]) -> tuple[float, float, str] | None:
+    try:
+        done = max(0.0, int(block['out_time_us']) / 1e6)
+    except (KeyError, ValueError):
+        return None  # 'N/A' until the first frame is written
+    try:
+        fps = float(block.get('fps', ''))
+    except ValueError:
+        fps = 0.0
+    return done, fps, block.get('speed', 'N/A').strip()
+
+# _progress: live display with one overall row and one row for the file being encoded
+def _progress(console: Console) -> Progress:
+    return Progress(
+        SpinnerColumn(), TextColumn('{task.description}'), BarColumn(), TaskProgressColumn(), TextColumn('{task.fields[stats]}'),
+        TimeRemainingColumn(), console=console,
+    )
+
+# _file_task: add a row for one file, returns its id and the Watch that feeds it
+# verbose also prints the ffmpeg command above the display
+def _file_task(progress: Progress, label: str, verbose: bool) -> tuple[TaskID, Watch]:
+    task = progress.add_task(escape(label[-40:]).ljust(40), total=None, stats='')
+    def update(done: float, total: float, fps: float, speed: str) -> None:
+        progress.update(task, total=total or None, completed=min(done, total) if total else 0, stats=f'{fps:.0f} fps {speed}')
+    def echo(cmd: str) -> None:
+        progress.console.print(escape(cmd), style='dim')
+    return task, Watch(update, echo if verbose else None)
+
+# _summary: one result line for a finished file
+def _summary(name: str, before: int, after: int, seconds: float) -> str:
+    pct = (1 - after / before) * 100 if before else 0.0
+    return f'{name}: {human_size(before)} to {human_size(after)} (-{pct:.0f}%) in {human_duration(seconds)}'
+
+# check_encoder: exit with a clear message when the encoder is unknown or this ffmpeg lacks it
+def check_encoder(encoder: str) -> None:
+    if encoder not in _ENCODERS:
+        raise SystemExit(f'unknown encoder {encoder!r}, choose from {", ".join(_ENCODERS)}')
+    if encoder == 'videotoolbox':
+        out = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True).stdout
+        if 'hevc_videotoolbox' not in out:
+            raise SystemExit('this ffmpeg has no hevc_videotoolbox encoder')
+
+# _video_args: the ffmpeg options that select the video encoder and its rate
+# videotoolbox has no presets and takes a scaled-up rate, and decodes on the hardware where it can (ffmpeg falls back to software)
+def _video_args(encoder: str, preset: str, rate: int) -> tuple[list[str], list[str]]:
+    if encoder == 'videotoolbox':
+        return ['-hwaccel', 'videotoolbox'], ['-c:v', 'hevc_videotoolbox', '-b:v', str(int(rate * _VT_RATE_SCALE))]
+    return [], ['-c:v', 'libx265', '-preset', preset, '-b:v', str(rate), '-x265-params', 'log-level=error']
+
 # _encode: re-encode to tmp at bpp keeping audio and subtitles, returns ffmpeg's last error line or None on success
 # vf adds a video filter (such as a crop) and rate overrides the bitrate derived from bpp
-def _encode(i: Info, tmp: str, bpp: float, preset: str, *, vf: str | None = None, rate: int | None = None) -> str | None:
+def _encode(i: Info, tmp: str, bpp: float, preset: str, *, vf: str | None = None, rate: int | None = None, watch: Watch | None = None, encoder: str = 'x265') -> str | None:
     rate = rate or int(i.width * i.height * i.fps * bpp)
-    cmd = ['ffmpeg', '-v', 'error', '-y', '-i', i.path, '-map', '0:v:0', '-map', '0:a?', '-map', '0:s?',
+    pre, enc = _video_args(encoder, preset, rate)
+    cmd = ['ffmpeg', '-v', 'error', '-y', '-progress', 'pipe:1', '-nostats', *pre, '-i', i.path, '-map', '0:v:0', '-map', '0:a?', '-map', '0:s?',
            *(['-vf', vf] if vf else []),
-           '-c', 'copy', '-c:v', 'libx265', '-preset', preset, '-b:v', str(rate), '-x265-params', 'log-level=error']
+           '-c', 'copy', *enc]
     if os.path.splitext(tmp)[1].lower() in _APPLE_TAG:
         cmd += ['-tag:v', 'hvc1']
-    proc = subprocess.run([*cmd, tmp], capture_output=True, text=True)
-    return None if proc.returncode == 0 else (proc.stderr.strip().splitlines() or ['ffmpeg failed'])[-1]
+    cmd.append(tmp)
+    if watch and watch.echo:
+        watch.echo(shlex.join(cmd))
+    with tempfile.TemporaryFile('w+') as err:  # a file, so a chatty stderr can never block the progress pipe
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err, text=True)
+        block: dict[str, str] = {}
+        for line in proc.stdout:
+            key, _, value = line.strip().partition('=')
+            block[key] = value
+            if key == 'progress':  # last line of each block
+                parsed, block = _parse_block(block), {}
+                if parsed and watch and watch.on_progress:
+                    watch.on_progress(parsed[0], i.duration, parsed[1], parsed[2])
+        proc.wait()
+        err.seek(0)
+        lines = err.read().strip().splitlines()
+    return None if proc.returncode == 0 else (lines or ['ffmpeg failed'])[-1]
 
 # _verify: why the new file cannot replace the original, or None when it is hevc, the same length and 10% smaller
 def _verify(old: Info, tmp: str) -> str | None:
@@ -190,11 +269,11 @@ def _verify(old: Info, tmp: str) -> str | None:
     return None
 
 # _reencode_one: encode beside the original, verify, then swap it in; returns (bytes saved, reason skipped)
-def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str, held: str | None) -> tuple[int, str]:
+def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str, held: str | None, watch: Watch | None = None, *, encoder: str = 'x265') -> tuple[int, str]:
     dst = _target(i.path)
     tmp = f'{os.path.splitext(i.path)[0]}.reencoding{os.path.splitext(dst)[1]}'
     try:
-        reason = _precheck(i, dst, held) or _encode(i, tmp, bpp, preset) or _verify(i, tmp)
+        reason = _precheck(i, dst, held) or _encode(i, tmp, bpp, preset, watch=watch, encoder=encoder) or _verify(i, tmp)
         if reason:
             return 0, reason
         saved = i.size - os.path.getsize(tmp)
@@ -256,10 +335,13 @@ def run_reencode(
     bpps: str = '0.03,0.06,0.10',
     preview_dir: str | None = None,
     apply: bool = False,
-    preset: str = 'medium',
+    preset: str = 'fast',
     yes: bool = False,
     keep_originals: str | None = None,
+    verbose: bool = False,
+    encoder: str = 'x265',
 ) -> None:
+    check_encoder(encoder)
     directory = os.path.abspath(directory)
     keep = os.path.abspath(keep_originals) if keep_originals else None
     console = Console()
@@ -290,11 +372,19 @@ def run_reencode(
     if db_path:
         fold_in_moved_paths(db_path)  # videos from the old `move` command sit at moved_to, not path
     saved = done = 0
-    for _, i in track(cands, description='Re-encoding'):
-        held = os.path.join(keep, os.path.relpath(i.path, directory)) if keep else None
-        gained, reason = _reencode_one(i, db_path, bpp, preset, held)
-        saved += gained
-        done += bool(gained)
-        if reason:
-            console.print(escape(f'skipped {i.path}: {reason}'), style='yellow')
+    with _progress(console) as progress:
+        overall = progress.add_task('Re-encoding'.ljust(40), total=len(cands), stats='')
+        for n, (_, i) in enumerate(cands):
+            held = os.path.join(keep, os.path.relpath(i.path, directory)) if keep else None
+            task, watch = _file_task(progress, os.path.relpath(i.path, directory), verbose)
+            start = time.monotonic()
+            gained, reason = _reencode_one(i, db_path, bpp, preset, held, watch, encoder=encoder)
+            progress.remove_task(task)
+            progress.update(overall, advance=1, stats=f'{n + 1}/{len(cands)} files')
+            saved += gained
+            done += bool(gained)
+            if reason:
+                progress.console.print(escape(f'skipped {i.path}: {reason}'), style='yellow')
+            else:
+                progress.console.print(escape(_summary(os.path.relpath(i.path, directory), i.size, i.size - gained, time.monotonic() - start)))
     console.print(f'[bold green]{human_size(saved)}[/] saved across {done}/{len(cands)} files')

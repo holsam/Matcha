@@ -112,9 +112,11 @@ def reencode(
     bpps: str = typer.Option("0.03,0.06,0.10", help="Comma separated bpp values to compare with --preview."),
     preview_dir: str | None = typer.Option(None, "--preview-dir", help="Where --preview writes (default: .matcha/tmp)."),
     execute: bool = typer.Option(False, "--apply", help="Re-encode the candidates in place (default is a dry run)."),
-    preset: str = typer.Option("medium", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
+    preset: str = typer.Option("fast", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
     yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
     keep_originals: str | None = typer.Option(None, "--keep-originals", help="Move originals here, with a symlink to each new file, instead of deleting."),
+    verbose: bool = typer.Option(False, "--verbose", help="Print each ffmpeg command."),
+    encoder: str = typer.Option("x265", help="HEVC encoder: x265 (software, best quality per bit) or videotoolbox (Apple hardware, much faster, larger files). --preset only applies to x265."),
 ):
     """Profile videos by codec and bitrate, and re-encode bloated ones to HEVC."""
     run_reencode(
@@ -130,6 +132,8 @@ def reencode(
         preset=preset,
         yes=yes,
         keep_originals=keep_originals,
+        verbose=verbose,
+        encoder=encoder,
     )
 
 @borders_app.command()
@@ -194,11 +198,13 @@ def apply_borders(
     directory: str = typer.Argument(..., help="Directory containing .matcha/borders.json."),
     min_confidence: float = typer.Option(0.0, help="Only crop videos where at least this share of frames agreed (0.0-1.0)."),
     only: str | None = typer.Option(None, "--only", help="Only crop videos whose path (relative to DIRECTORY) matches this glob."),
-    preset: str = typer.Option("medium", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
+    preset: str = typer.Option("fast", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
     keep_originals: str | None = typer.Option(None, "--keep-originals", help="Move originals here, with a symlink to each new file, instead of deleting."),
+    verbose: bool = typer.Option(False, "--verbose", help="Print each ffmpeg command."),
+    encoder: str = typer.Option("x265", help="HEVC encoder: x265 (software, best quality per bit) or videotoolbox (Apple hardware, much faster, larger files). --preset only applies to x265."),
 ):
     """Crop videos with detected borders in place, re-encoded to HEVC. Originals are deleted immediately; check with `borders preview` first."""
-    raise SystemExit(run_apply(directory, min_confidence=min_confidence, only=only, preset=preset, keep_originals=keep_originals))
+    raise SystemExit(run_apply(directory, min_confidence=min_confidence, only=only, preset=preset, keep_originals=keep_originals, verbose=verbose, encoder=encoder))
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(
