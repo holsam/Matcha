@@ -128,9 +128,12 @@ from matcha.cli import app
 
 needs_ffmpeg = pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg not installed')
 
-# clip: encode a tiny test clip from a lavfi graph (-vf style filters on a 640x360 testsrc)
-def clip(path: Path, vf: str = 'null', *, d: int = 6, src: str = 'gradients=s=640x360:r=10:seed=7', extra: tuple[str, ...] = ()) -> Path:
-    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', f'{src}:d={d}', '-vf', vf,
+# GRAD: deterministic bright horizontal luma ramp, {d} is the duration
+GRAD = 'nullsrc=s=640x360:r=10:d={d},geq=lum=80+120*X/W:cb=128:cr=128'
+
+# clip: encode a tiny test clip from a lavfi graph (-vf style filters on a 640x360 ramp)
+def clip(path: Path, vf: str = 'null', *, d: int = 6, src: str = GRAD, extra: tuple[str, ...] = ()) -> Path:
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', src.format(d=d), '-vf', vf,
                     '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', *extra, str(path)], check=True)
     return path
 
@@ -155,14 +158,13 @@ def test_scan_video_no_border_stops_at_stage_a(tmp_path):
 
 @needs_ffmpeg
 def test_scan_video_dark_is_insufficient(tmp_path):
-    v, _ = scan_video(str(clip(tmp_path / 'a.mp4', 'pad=640:480:0:60:black', src='color=c=0x181818:s=640x360:r=10')), P)
+    v, _ = scan_video(str(clip(tmp_path / 'a.mp4', 'pad=640:480:0:60:black', src='color=c=0x181818:s=640x360:r=10:d={d}')), P)
     assert v.result == 'insufficient'
 
 @needs_ffmpeg
 def test_scan_video_short_windowbox_segment_is_no_border(tmp_path):
     out = tmp_path / 'a.mp4'
-    graph = ('testsrc=s=640x360:r=10:d=18[a];testsrc=s=640x360:r=10:d=2,scale=480:270,pad=640:360:80:45[b];'
-             '[a][b]concat=n=2:v=1:a=0')
+    graph = (GRAD.format(d=18) + '[a];' + GRAD.format(d=2) + ',scale=480:270,pad=640:360:80:45[b];[a][b]concat=n=2:v=1:a=0')
     subprocess.run(['ffmpeg', '-v', 'error', '-y', '-filter_complex', graph, '-c:v', 'libx264', '-preset', 'ultrafast',
                     '-pix_fmt', 'yuv420p', str(out)], check=True)
     assert scan_video(str(out), P)[0].result == 'no border'
@@ -391,3 +393,91 @@ def test_cli_scan(library, monkeypatch):
 
 def test_cli_scan_missing_directory(tmp_path):
     assert CliRunner().invoke(app, ['borders', 'scan', str(tmp_path / 'nope')]).exit_code == 1
+
+
+# ---- phase 3: list ----
+
+from matcha.borders import run_list
+
+# seed_store: write a borders.json from (name, result, crop, confidence, status) rows and make the files exist
+def seed_store(lib: Path, rows) -> None:
+    videos = {}
+    for name, result, crop, conf, *rest in rows:
+        (lib / name).parent.mkdir(parents=True, exist_ok=True)
+        (lib / name).write_bytes(b'x')
+        videos[name] = {'size': 1, 'mtime': 1.0, 'params_hash': 'x', 'status': rest[0] if rest else 'complete', 'result': result,
+                        'crop': crop and dict(zip(('top', 'bottom', 'left', 'right'), crop)), 'confidence': conf, 'frames_used': 20}
+    (lib / '.matcha').mkdir(exist_ok=True)
+    (lib / '.matcha' / 'borders.json').write_text(json.dumps({'version': 1, 'videos': videos}))
+
+ROWS = [
+    ('b.mp4', 'border', (70, 70, 0, 0), 0.9),
+    ('a.mp4', 'border', (0, 0, 80, 80), 1.0),
+    ('c.mp4', 'variable', None, 0.5),
+    ('d.mp4', 'no border', None, 1.0),
+    ('e.mp4', 'border', (4, 4, 0, 0), 0.85),
+    ('f.mp4', 'border', None, 0.0, 'pending'),
+]
+
+# listed: run `borders list --json` and return the parsed items
+def listed(lib, capsys, **kw):
+    code = run_list(str(lib), as_json=True, **kw)
+    assert code == 0
+    return json.loads(capsys.readouterr().out)
+
+@pytest.fixture
+def listing(tmp_path, monkeypatch):
+    seed_store(tmp_path, ROWS)
+    monkeypatch.setattr(borders, '_dims', lambda path: (960, 540, 100.0))
+    return tmp_path
+
+def test_list_only_border_by_default(listing, capsys):
+    assert [i['path'] for i in listed(listing, capsys)] == ['a.mp4', 'b.mp4', 'e.mp4']
+
+def test_list_include_variable(listing, capsys):
+    items = listed(listing, capsys, include_variable=True)
+    assert [i['path'] for i in items] == ['a.mp4', 'b.mp4', 'c.mp4', 'e.mp4']
+    assert items[2]['crop'] is None and items[2]['out_width'] is None
+
+def test_list_json_fields(listing, capsys):
+    a = listed(listing, capsys)[0]
+    assert (a['width'], a['height'], a['out_width'], a['out_height']) == (960, 540, 800, 540)
+    assert a['crop'] == {'top': 0, 'bottom': 0, 'left': 80, 'right': 80}
+
+def test_list_vanished_files_omitted(listing, capsys):
+    (listing / 'a.mp4').unlink()
+    assert [i['path'] for i in listed(listing, capsys)] == ['b.mp4', 'e.mp4']
+
+def test_list_min_confidence(listing, capsys):
+    assert [i['path'] for i in listed(listing, capsys, min_confidence=0.9)] == ['a.mp4', 'b.mp4']
+
+def test_list_sort(listing, capsys):
+    assert [i['path'] for i in listed(listing, capsys, sort='confidence')] == ['a.mp4', 'b.mp4', 'e.mp4']
+    assert [i['path'] for i in listed(listing, capsys, sort='area')] == ['b.mp4', 'a.mp4', 'e.mp4']  # 134400, 86400, 7680 px removed
+    assert run_list(str(listing), sort='nope') == 1
+
+def test_list_table_footer_and_markup_escape(tmp_path, monkeypatch, capsys):
+    seed_store(tmp_path, [('[red]odd[/red].mp4', 'border', (70, 70, 0, 0), 0.9), ('n.mp4', 'no border', None, 1.0), ('p.mp4', 'border', None, 0, 'pending')])
+    monkeypatch.setattr(borders, '_dims', lambda path: (960, 540, 100.0))
+    assert run_list(str(tmp_path)) == 0
+    out = capsys.readouterr().out
+    assert '[red]odd[/red]' in out and '3 stored: 1 border, 1 no border, 0 variable, 0 insufficient, 1 pending' in out
+
+def test_list_unprobeable_file_still_listed(listing, capsys, monkeypatch):
+    monkeypatch.setattr(borders, '_dims', lambda path: None)
+    a = listed(listing, capsys)[0]
+    assert a['width'] is None and a['crop'] is not None
+
+def test_list_no_store(tmp_path, capsys):
+    assert run_list(str(tmp_path)) == 1
+    assert 'borders scan' in capsys.readouterr().out
+
+def test_list_unreadable_store_left_in_place(tmp_path):
+    (tmp_path / '.matcha').mkdir()
+    (tmp_path / '.matcha' / 'borders.json').write_text('{bad')
+    assert run_list(str(tmp_path)) == 1
+    assert (tmp_path / '.matcha' / 'borders.json').exists()
+
+def test_cli_list(listing):
+    r = CliRunner().invoke(app, ['borders', 'list', str(listing), '--json', '--sort', 'confidence'])
+    assert r.exit_code == 0 and [i['path'] for i in json.loads(r.output)] == ['a.mp4', 'b.mp4', 'e.mp4']

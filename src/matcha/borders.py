@@ -12,6 +12,7 @@ from typing import Literal
 import numpy as np
 from rich.console import Console
 from rich.markup import escape
+from rich.table import Table
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
 # Import internal matcha objects
@@ -289,6 +290,66 @@ def run_scan(
     if errors:
         console.print(f'{len(errors)} videos failed and stay pending')
 
+# run_list: print flagged videos with their crop boxes, returns the exit code
+def run_list(
+    directory: str,
+    *,
+    include_variable: bool = False,
+    min_confidence: float = 0.0,
+    sort: str = 'path',
+    as_json: bool = False,
+) -> int:
+    console = Console()
+    root = os.path.abspath(directory)
+    path = os.path.join(root, '.matcha', 'borders.json')
+    if sort not in ('path', 'confidence', 'area'):
+        console.print(f'Unknown sort {escape(repr(sort))}, use path, confidence or area.')
+        return 1
+    try:
+        with open(path) as f:
+            videos = json.load(f)['videos']
+    except FileNotFoundError:
+        console.print('No border store found. Run `matcha borders scan` first.')
+        return 1
+    except (OSError, ValueError, KeyError, TypeError):  # read-only: scan is the command that moves a bad store aside
+        console.print(f'Unreadable store {escape(path)}. Run `matcha borders scan` to rebuild it.')
+        return 1
+    wanted = {'border', 'variable'} if include_variable else {'border'}
+    rows = [
+        (rel, e) for rel, e in videos.items()
+        if e.get('status') == 'complete' and e.get('result') in wanted
+        and (e.get('confidence') or 0) >= min_confidence and os.path.exists(os.path.join(root, rel))
+    ]
+    with ThreadPoolExecutor(max_workers=4) as ex:  # only flagged rows are probed, the store holds no dimensions
+        dims = list(ex.map(lambda r: _dims(os.path.join(root, r[0])), rows))
+    items = [_item(rel, e, d) for (rel, e), d in zip(rows, dims)]
+    items.sort(key={
+        'path': lambda i: i['path'],
+        'confidence': lambda i: (-i['confidence'], i['path']),
+        'area': lambda i: (-i['removed_pixels'], i['path']),
+    }[sort])
+    if as_json:
+        print(json.dumps(items, indent=1))
+        return 0
+    table = Table(title='Videos with borders')
+    for col, right in (('Path', False), ('Result', False), ('Source', True), ('Crop (t b l r)', True), ('Output', True), ('Conf.', True)):
+        table.add_column(col, justify='right' if right else 'left')
+    for i in items:
+        c = i['crop']
+        table.add_row(
+            escape(i['path']), i['result'],
+            f'{i["width"]}x{i["height"]}' if i['width'] else '?',
+            ' '.join(str(c[k]) for k in ('top', 'bottom', 'left', 'right')) if c else '-',
+            f'{i["out_width"]}x{i["out_height"]}' if i['out_width'] else '-',
+            f'{i["confidence"]:.2f}',
+        )
+    console.print(table)
+    done = [e for e in videos.values() if e.get('status') == 'complete']
+    pending = len(videos) - len(done)
+    tally = ', '.join(f'{sum(e.get("result") == r for e in done)} {r}' for r in ('border', 'no border', 'variable', 'insufficient'))
+    console.print(f'{len(videos)} stored: {tally}, {pending} pending')
+    return 0
+
 # snap_even: left and top floored to even, output size forced even by trimming at most 1 px from right or bottom
 def snap_even(crop: Crop, size: tuple[int, int]) -> Crop:
     w, h = size
@@ -379,3 +440,14 @@ def _fresh(entry: dict | None, st: os.stat_result, ph: str) -> bool:
         entry and entry.get('status') == 'complete' and entry.get('size') == st.st_size
         and entry.get('mtime') == st.st_mtime and entry.get('params_hash') == ph
     )
+
+# _item: list/JSON record for one stored video, dimensions are None when the file cannot be probed
+def _item(rel: str, e: dict, dims: tuple[int, int, float] | None) -> dict:
+    crop = e.get('crop')
+    w, h = (dims[0], dims[1]) if dims else (None, None)
+    out = (w - crop['left'] - crop['right'], h - crop['top'] - crop['bottom']) if crop and dims else (None, None)
+    removed = w * h - out[0] * out[1] if crop and dims else 0
+    return {
+        'path': rel, 'result': e['result'], 'crop': crop, 'confidence': e.get('confidence') or 0.0,
+        'width': w, 'height': h, 'out_width': out[0], 'out_height': out[1], 'removed_pixels': removed,
+    }

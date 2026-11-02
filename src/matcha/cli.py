@@ -2,7 +2,7 @@ import os, subprocess, sys
 import typer
 
 from matcha.apply import run as run_apply
-from matcha.borders import Params, run_scan
+from matcha.borders import Params, run_list, run_scan
 from matcha.continuer import run_continue
 from matcha.db import fold_in_moved_paths, init_schema
 from matcha.plan import run_plan
@@ -167,6 +167,17 @@ def scan(
         frames_a=frames_a, frames_b=frames_b, span=(span_start, span_end), max_width=max_width,
     )
     run_scan(directory, params=params, workers=workers, rescan=rescan, flush_every=flush_every, prune=prune)
+
+@borders_app.command(name="list")
+def list_(
+    directory: str = typer.Argument(..., help="Directory containing .matcha/borders.json."),
+    include_variable: bool = typer.Option(False, "--include-variable", help="Also list videos whose borders vary, for review."),
+    min_confidence: float = typer.Option(0.0, help="Minimum share of frames that agreed (0.0-1.0)."),
+    sort: str = typer.Option("path", help="Sort by path, confidence or area (pixels removed)."),
+    as_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON instead of a table."),
+):
+    """List videos with detected borders and their crop boxes."""
+    raise SystemExit(run_list(directory, include_variable=include_variable, min_confidence=min_confidence, sort=sort, as_json=as_json))
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(
