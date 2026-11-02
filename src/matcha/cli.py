@@ -2,7 +2,7 @@ import os, subprocess, sys
 import typer
 
 from matcha.apply import run as run_apply
-from matcha.borders import Params, run_list, run_scan
+from matcha.borders import Params, run_list, run_preview, run_scan
 from matcha.continuer import run_continue
 from matcha.db import fold_in_moved_paths, init_schema
 from matcha.plan import run_plan
@@ -178,6 +178,16 @@ def list_(
 ):
     """List videos with detected borders and their crop boxes."""
     raise SystemExit(run_list(directory, include_variable=include_variable, min_confidence=min_confidence, sort=sort, as_json=as_json))
+
+@borders_app.command()
+def preview(
+    path: str = typer.Argument(..., help="Video to preview."),
+    at: float | None = typer.Option(None, help="Seconds into the video (default: a representative frame near the middle)."),
+    out: str | None = typer.Option(None, "--out", help="Image to write (default: .matcha/tmp/borders_<name>.png)."),
+    detect: bool = typer.Option(False, "--detect", help="Detect afresh with default thresholds instead of using the stored result."),
+):
+    """Save a frame with the proposed crop box drawn on it."""
+    raise SystemExit(run_preview(path, at=at, out=out, detect=detect))
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(

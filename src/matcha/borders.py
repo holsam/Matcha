@@ -10,6 +10,7 @@ from dataclasses import asdict, astuple, dataclass
 from typing import Literal
 
 import numpy as np
+from PIL import Image, ImageDraw
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
@@ -350,6 +351,55 @@ def run_list(
     console.print(f'{len(videos)} stored: {tally}, {pending} pending')
     return 0
 
+# run_preview: save a frame with the proposed crop box drawn on it, returns the exit code
+def run_preview(path: str, *, at: float | None = None, out: str | None = None, detect: bool = False) -> int:
+    console = Console()
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        console.print(f'Not a file: {escape(path)}')
+        return 1
+    dims = _dims(path)
+    if dims is None or dims[2] <= 0:
+        console.print(f'Cannot read video details from {escape(path)}')
+        return 1
+    w, h, duration = dims
+    root, videos = _find_store(path)
+    entry = videos.get(os.path.relpath(path, root)) if videos else None
+    st = os.stat(path)
+    if entry and entry.get('status') == 'complete' and (entry.get('size'), entry.get('mtime')) != (st.st_size, st.st_mtime):
+        console.print('Stored result is stale (file changed), detecting afresh.')
+        entry = None
+    if detect or not entry or entry.get('status') != 'complete':
+        verdict, _ = scan_video(path, Params())
+        result, crop = verdict.result, verdict.crop and asdict(verdict.crop)
+        console.print('Detected afresh, nothing is written to the store.')
+    else:
+        result, crop = entry['result'], entry.get('crop')
+    box = Crop(**crop) if crop else None
+    if at is None:
+        at = _pick_time(path, duration, (w, h), box) if box else duration / 2
+    out = out or os.path.join(root, '.matcha', 'tmp', f'borders_{os.path.splitext(os.path.basename(path))[0]}.png')
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    if not _grab(path, at, out):
+        console.print(f'Could not read a frame at {at:.1f}s')
+        return 1
+    if box:
+        with Image.open(out) as im:
+            img = im.convert('RGB')
+        iw, ih = img.size
+        sx, sy = iw / w, ih / h  # the grabbed frame should match the probe, scale in case it does not
+        ImageDraw.Draw(img).rectangle(
+            [round(box.left * sx), round(box.top * sy), iw - 1 - round(box.right * sx), ih - 1 - round(box.bottom * sy)],
+            outline=(255, 0, 0), width=max(2, iw // 300),
+        )
+        img.save(out)
+        console.print(f'{result}: top {box.top}, bottom {box.bottom}, left {box.left}, right {box.right}, '
+                      f'output {w - box.left - box.right}x{h - box.top - box.bottom}')
+    else:
+        console.print(f'Result is {result!r}, so no crop box is drawn.')
+    print(out)
+    return 0
+
 # snap_even: left and top floored to even, output size forced even by trimming at most 1 px from right or bottom
 def snap_even(crop: Crop, size: tuple[int, int]) -> Crop:
     w, h = size
@@ -451,3 +501,40 @@ def _item(rel: str, e: dict, dims: tuple[int, int, float] | None) -> dict:
         'path': rel, 'result': e['result'], 'crop': crop, 'confidence': e.get('confidence') or 0.0,
         'width': w, 'height': h, 'out_width': out[0], 'out_height': out[1], 'removed_pixels': removed,
     }
+
+# _find_store: (directory, videos) of the nearest borders.json above path, or (the video's directory, None) when there is none
+def _find_store(path: str) -> tuple[str, dict | None]:
+    here = os.path.dirname(path)
+    root = here
+    while True:
+        store = os.path.join(root, '.matcha', 'borders.json')
+        if os.path.exists(store):
+            try:
+                with open(store) as f:
+                    return root, json.load(f)['videos']
+            except (OSError, ValueError, KeyError, TypeError):
+                return here, None
+        parent = os.path.dirname(root)
+        if parent == root:
+            return here, None
+        root = parent
+
+# _pick_time: sample time nearest the middle whose frame shows the stored crop, so the preview is a representative frame
+def _pick_time(path: str, duration: float, source: tuple[int, int], crop: Crop) -> float:
+    p = Params()
+    shape = (max(1, round(source[1] * min(source[0], p.max_width) / source[0])), min(source[0], p.max_width))
+    for t in sorted(_times(duration, p), key=lambda t: abs(t - duration / 2)):
+        gray = sample_frame(path, t, shape)
+        r = None if gray is None else detect_frame(gray, p)
+        if r is not None and _close(_scale(r, source), crop, 2 * p.agree_px):
+            return t
+    return duration / 2
+
+# _grab: save the full-size frame at t seconds as an image, False when ffmpeg cannot deliver it
+def _grab(path: str, t: float, out: str) -> bool:
+    cmd = ['ffmpeg', '-v', 'error', '-y', '-ss', f'{t:.3f}', '-i', path, '-frames:v', '1', out]
+    try:
+        subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=_TIMEOUT, check=True)
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return os.path.exists(out)

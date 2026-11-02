@@ -481,3 +481,119 @@ def test_list_unreadable_store_left_in_place(tmp_path):
 def test_cli_list(listing):
     r = CliRunner().invoke(app, ['borders', 'list', str(listing), '--json', '--sort', 'confidence'])
     assert r.exit_code == 0 and [i['path'] for i in json.loads(r.output)] == ['a.mp4', 'b.mp4', 'e.mp4']
+
+
+# ---- phase 4: preview ----
+
+from PIL import Image
+from matcha.borders import run_preview
+
+# is_red: pixel is the preview's red outline
+def is_red(px) -> bool:
+    return px[0] > 200 and px[1] < 60 and px[2] < 60
+
+# red_count: number of red pixels in an image file
+def red_count(path) -> int:
+    with Image.open(path) as im:
+        return sum(is_red(px) for px in im.convert('RGB').get_flattened_data())
+
+@needs_ffmpeg
+def test_preview_draws_box_from_store(tmp_path, capsys):
+    lib = tmp_path / 'lib'
+    lib.mkdir()
+    clip(lib / 'a.mp4', 'pad=640:480:0:60:black')
+    run_scan(str(lib), workers=1)
+    out = tmp_path / 'p.png'
+    assert run_preview(str(lib / 'a.mp4'), out=str(out)) == 0
+    with Image.open(out) as im:
+        im = im.convert('RGB')
+        assert im.size == (640, 480)
+        assert is_red(im.getpixel((320, 60))) and is_red(im.getpixel((320, 419)))  # top and bottom edges of the box
+        assert not is_red(im.getpixel((320, 30)))  # bar is untouched
+    assert capsys.readouterr().out.strip().endswith(str(out))
+
+@needs_ffmpeg
+def test_preview_without_store_detects_and_writes_no_store(tmp_path, capsys):
+    clip(tmp_path / 'a.mp4', 'pad=640:480:0:60:black')
+    assert run_preview(str(tmp_path / 'a.mp4')) == 0
+    assert (tmp_path / '.matcha' / 'tmp' / 'borders_a.png').exists()
+    assert not (tmp_path / '.matcha' / 'borders.json').exists()
+    assert 'Detected afresh' in capsys.readouterr().out
+
+# fake_grab: stand-in for _grab that writes a 640x480 grey image and records the time asked for
+def fake_grab(monkeypatch):
+    asked: list[float] = []
+    def grab(path, t, out):
+        asked.append(t)
+        Image.new('RGB', (640, 480), (90, 90, 90)).save(out)
+        return True
+    monkeypatch.setattr(borders, '_grab', grab)
+    monkeypatch.setattr(borders, '_dims', lambda path: (640, 480, 100.0))
+    return asked
+
+# stored_video: library with one video and a stored entry matching its size and mtime
+def stored_video(tmp_path, result='border', crop=(60, 60, 0, 0)):
+    seed_store(tmp_path, [('a.mp4', result, crop, 0.9)])
+    st = os.stat(tmp_path / 'a.mp4')
+    data = json.loads((tmp_path / '.matcha' / 'borders.json').read_text())
+    data['videos']['a.mp4'].update(size=st.st_size, mtime=st.st_mtime)
+    (tmp_path / '.matcha' / 'borders.json').write_text(json.dumps(data))
+    return tmp_path / 'a.mp4'
+
+def test_preview_at_is_respected(tmp_path, monkeypatch):
+    asked = fake_grab(monkeypatch)
+    assert run_preview(str(stored_video(tmp_path)), at=12.5) == 0
+    assert asked == [12.5]
+    assert red_count(tmp_path / '.matcha' / 'tmp' / 'borders_a.png') > 0
+
+def test_preview_no_crop_draws_nothing(tmp_path, monkeypatch, capsys):
+    fake_grab(monkeypatch)
+    assert run_preview(str(stored_video(tmp_path, 'variable', None))) == 0
+    assert red_count(tmp_path / '.matcha' / 'tmp' / 'borders_a.png') == 0
+    assert "'variable'" in capsys.readouterr().out
+
+def test_preview_stale_entry_detects_afresh(tmp_path, monkeypatch):
+    fake_grab(monkeypatch)
+    video = stored_video(tmp_path)
+    video.write_bytes(b'changed length')
+    called = []
+    monkeypatch.setattr(borders, 'scan_video', lambda path, p: (called.append(path) or Verdict('no border', None, 1.0, 20), 'A'))
+    assert run_preview(str(video)) == 0
+    assert called and red_count(tmp_path / '.matcha' / 'tmp' / 'borders_a.png') == 0
+
+def test_preview_detect_flag_ignores_store(tmp_path, monkeypatch):
+    fake_grab(monkeypatch)
+    called = []
+    monkeypatch.setattr(borders, 'scan_video', lambda path, p: (called.append(path) or Verdict('no border', None, 1.0, 20), 'A'))
+    assert run_preview(str(stored_video(tmp_path)), detect=True) == 0 and called
+
+def test_preview_finds_store_in_parent_directory(tmp_path, monkeypatch):
+    seed_store(tmp_path, [('sub/a.mp4', 'border', (60, 60, 0, 0), 0.9)])
+    st = os.stat(tmp_path / 'sub' / 'a.mp4')
+    data = json.loads((tmp_path / '.matcha' / 'borders.json').read_text())
+    data['videos']['sub/a.mp4'].update(size=st.st_size, mtime=st.st_mtime)
+    (tmp_path / '.matcha' / 'borders.json').write_text(json.dumps(data))
+    fake_grab(monkeypatch)
+    assert run_preview(str(tmp_path / 'sub' / 'a.mp4'), at=1) == 0
+    assert (tmp_path / '.matcha' / 'tmp' / 'borders_a.png').exists()  # written beside the store, not the video
+
+def test_preview_representative_time_prefers_middle(monkeypatch):
+    monkeypatch.setattr(borders, 'sample_frame', lambda path, t, shape: BORDERED if t > 40 else BRIGHT)
+    t = borders._pick_time('x.mp4', 100.0, (960, 540), Crop(70, 70, 0, 0))
+    assert abs(t - 50) <= 3
+
+def test_preview_representative_time_falls_back_to_middle(monkeypatch):
+    monkeypatch.setattr(borders, 'sample_frame', lambda path, t, shape: DARK)
+    assert borders._pick_time('x.mp4', 100.0, (960, 540), Crop(70, 70, 0, 0)) == 50.0
+
+def test_preview_missing_or_unreadable_file(tmp_path):
+    assert run_preview(str(tmp_path / 'nope.mp4')) == 1
+    junk = tmp_path / 'junk.mp4'
+    junk.write_bytes(b'x')
+    assert run_preview(str(junk)) == 1
+
+def test_cli_preview(tmp_path, monkeypatch):
+    fake_grab(monkeypatch)
+    out = tmp_path / 'o.png'
+    r = CliRunner().invoke(app, ['borders', 'preview', str(stored_video(tmp_path)), '--out', str(out), '--at', '3'])
+    assert r.exit_code == 0 and out.exists()
