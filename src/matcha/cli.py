@@ -2,6 +2,7 @@ import os, subprocess, sys
 import typer
 
 from matcha.apply import run as run_apply
+from matcha.borders import Params, run_scan
 from matcha.continuer import run_continue
 from matcha.db import fold_in_moved_paths, init_schema
 from matcha.plan import run_plan
@@ -10,6 +11,9 @@ from matcha.matcher import run_match
 from matcha.reencode import run_reencode
 
 app = typer.Typer(help="Matcha — a video matching tool using perceptual hashing.")
+borders_app = typer.Typer(help="Find videos with black borders and plan crops.")
+app.add_typer(borders_app, name="borders", rich_help_panel="Additional utilities")
+_D = Params()  # defaults for the borders options
 
 
 @app.command(rich_help_panel="Identify matches")
@@ -127,6 +131,42 @@ def reencode(
         yes=yes,
         keep_originals=keep_originals,
     )
+
+@borders_app.command()
+def scan(
+    directory: str = typer.Argument(..., help="Directory to scan."),
+    workers: int = typer.Option(4, help="Number of parallel scan workers."),
+    rescan: bool = typer.Option(False, "--rescan", help="Scan every video again, even if up to date."),
+    prune: bool = typer.Option(False, "--prune", help="Forget stored videos that no longer exist."),
+    flush_every: float = typer.Option(30.0, help="Seconds between saves of .matcha/borders.json."),
+    black_tol: int = typer.Option(_D.black_tol, help="Luma above the frame's own black level still counted as black."),
+    max_black_ref: int = typer.Option(_D.max_black_ref, help="Cap on the black level estimated from a frame."),
+    blank_frac: float = typer.Option(_D.blank_frac, help="Share of black pixels that makes a row or column blank."),
+    min_margin_frac: float = typer.Option(_D.min_margin_frac, help="Ignore margins under this share of the frame."),
+    min_content_luma: float = typer.Option(_D.min_content_luma, help="Mean luma the picture needs for a frame to count."),
+    min_edge_step: float = typer.Option(_D.min_edge_step, help="Luma step needed across a border edge."),
+    edge_band: int = typer.Option(_D.edge_band, help="Lines each side of an edge used for the step."),
+    agree_px: int = typer.Option(_D.agree_px, help="Margins agree when within this many pixels."),
+    agree_frac: float = typer.Option(_D.agree_frac, help="Share of informative frames that must agree."),
+    min_informative_a: int = typer.Option(_D.min_informative_a, help="Informative frames needed to finish after the quick pass."),
+    min_informative_b: int = typer.Option(_D.min_informative_b, help="Informative frames needed after the full pass."),
+    frames_a: int = typer.Option(_D.frames_a, help="Frames in the quick pass."),
+    frames_b: int = typer.Option(_D.frames_b, help="Frames in the full pass."),
+    span_start: float = typer.Option(_D.span[0], help="Start of the sampled part of each video (0-1)."),
+    span_end: float = typer.Option(_D.span[1], help="End of the sampled part of each video (0-1)."),
+    max_width: int = typer.Option(_D.max_width, help="Frames are scaled down to this width before analysis."),
+):
+    """Scan videos in DIRECTORY for black borders and record them in .matcha/borders.json."""
+    if not os.path.isdir(directory):
+        typer.echo(f"Not a directory: {directory}")
+        raise SystemExit(1)
+    params = Params(
+        black_tol=black_tol, max_black_ref=max_black_ref, blank_frac=blank_frac, min_margin_frac=min_margin_frac,
+        min_content_luma=min_content_luma, min_edge_step=min_edge_step, edge_band=edge_band, agree_px=agree_px,
+        agree_frac=agree_frac, min_informative_a=min_informative_a, min_informative_b=min_informative_b,
+        frames_a=frames_a, frames_b=frames_b, span=(span_start, span_end), max_width=max_width,
+    )
+    run_scan(directory, params=params, workers=workers, rescan=rescan, flush_every=flush_every, prune=prune)
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(

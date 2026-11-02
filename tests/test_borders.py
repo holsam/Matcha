@@ -114,3 +114,280 @@ def test_params_hash():
     assert params_hash(P) == params_hash(Params())
     for field, value in [('black_tol', 5), ('agree_frac', 0.9), ('span', (0.1, 0.9)), ('max_width', 320)]:
         assert params_hash(replace(P, **{field: value})) != params_hash(P)
+
+
+# ---- phase 2: sampling, scan, store ----
+
+import json, os, shutil, subprocess, threading
+from pathlib import Path
+from typer.testing import CliRunner
+
+from matcha import borders
+from matcha.borders import Store, Verdict, run_scan, scan_video
+from matcha.cli import app
+
+needs_ffmpeg = pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='ffmpeg not installed')
+
+# clip: encode a tiny test clip from a lavfi graph (-vf style filters on a 640x360 testsrc)
+def clip(path: Path, vf: str = 'null', *, d: int = 6, src: str = 'gradients=s=640x360:r=10:seed=7', extra: tuple[str, ...] = ()) -> Path:
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', f'{src}:d={d}', '-vf', vf,
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', *extra, str(path)], check=True)
+    return path
+
+# near: crop within 2 px of (top, bottom, left, right)
+def near(crop: Crop | None, want: tuple[int, int, int, int]) -> bool:
+    return crop is not None and all(abs(a - b) <= 2 for a, b in zip((crop.top, crop.bottom, crop.left, crop.right), want))
+
+@needs_ffmpeg
+def test_scan_video_letterbox(tmp_path):
+    v, stage = scan_video(str(clip(tmp_path / 'a.mp4', 'pad=640:480:0:60:black')), P)
+    assert v.result == 'border' and near(v.crop, (60, 60, 0, 0)) and stage == 'B'
+
+@needs_ffmpeg
+def test_scan_video_pillarbox(tmp_path):
+    v, _ = scan_video(str(clip(tmp_path / 'a.mp4', 'pad=800:360:80:0:black')), P)
+    assert v.result == 'border' and near(v.crop, (0, 0, 80, 80))
+
+@needs_ffmpeg
+def test_scan_video_no_border_stops_at_stage_a(tmp_path):
+    v, stage = scan_video(str(clip(tmp_path / 'a.mp4')), P)
+    assert (v.result, stage) == ('no border', 'A')
+
+@needs_ffmpeg
+def test_scan_video_dark_is_insufficient(tmp_path):
+    v, _ = scan_video(str(clip(tmp_path / 'a.mp4', 'pad=640:480:0:60:black', src='color=c=0x181818:s=640x360:r=10')), P)
+    assert v.result == 'insufficient'
+
+@needs_ffmpeg
+def test_scan_video_short_windowbox_segment_is_no_border(tmp_path):
+    out = tmp_path / 'a.mp4'
+    graph = ('testsrc=s=640x360:r=10:d=18[a];testsrc=s=640x360:r=10:d=2,scale=480:270,pad=640:360:80:45[b];'
+             '[a][b]concat=n=2:v=1:a=0')
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-filter_complex', graph, '-c:v', 'libx264', '-preset', 'ultrafast',
+                    '-pix_fmt', 'yuv420p', str(out)], check=True)
+    assert scan_video(str(out), P)[0].result == 'no border'
+
+@needs_ffmpeg
+def test_scan_video_rotated_crop_is_in_displayed_orientation(tmp_path):
+    src = clip(tmp_path / 'src.mp4', 'pad=640:480:0:60:black')
+    out = tmp_path / 'rot.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-display_rotation', '90', '-i', str(src), '-c', 'copy', str(out)], check=True)
+    v, _ = scan_video(str(out), P)
+    assert v.result == 'border' and near(v.crop, (0, 0, 60, 60))
+
+@needs_ffmpeg
+def test_scan_video_very_short_clip(tmp_path):
+    v, _ = scan_video(str(clip(tmp_path / 'a.mp4', 'pad=640:480:0:60:black', d=1)), P)
+    assert v.result in ('border', 'insufficient')  # tiny clips must not crash; border once enough distinct frames exist
+
+# Stub frames for stage logic without ffmpeg
+BRIGHT = make_frame()
+BORDERED = make_frame(top=70, bottom=70)
+DARK = make_frame(lo=18, hi=45)
+
+# stub_sampler: patch _dims and sample_frame, returns the list of sampled times
+def stub_sampler(monkeypatch, frame_for, duration=100.0):
+    calls: list[float] = []
+    monkeypatch.setattr(borders, '_dims', lambda path: (960, 540, duration))
+    def fake(path, t, shape):
+        calls.append(t)
+        return frame_for(t)
+    monkeypatch.setattr(borders, 'sample_frame', fake)
+    return calls
+
+def test_stage_a_short_circuit(monkeypatch):
+    calls = stub_sampler(monkeypatch, lambda t: BRIGHT)
+    v, stage = scan_video('x.mp4', P)
+    assert (v.result, stage, len(calls)) == ('no border', 'A', P.frames_a)
+
+def test_stage_b_for_bordered_reuses_stage_a_frames(monkeypatch):
+    calls = stub_sampler(monkeypatch, lambda t: BORDERED)
+    v, stage = scan_video('x.mp4', P)
+    assert (v.result, stage) == ('border', 'B')
+    assert len(calls) == len(set(calls)) == P.frames_b
+
+def test_dark_video_goes_to_stage_b_then_insufficient(monkeypatch):
+    calls = stub_sampler(monkeypatch, lambda t: DARK)
+    v, stage = scan_video('x.mp4', P)
+    assert (v.result, stage, len(calls)) == ('insufficient', 'B', P.frames_b)
+
+def test_unreadable_probe_is_insufficient(monkeypatch):
+    monkeypatch.setattr(borders, '_dims', lambda path: None)
+    assert scan_video('x.mp4', P)[0].result == 'insufficient'
+
+def test_times_dedupe_on_very_short_video():
+    assert len(borders._times(0.3, P)) < P.frames_b
+
+# library: directory of dummy video files (content is irrelevant when scan_video is stubbed)
+@pytest.fixture
+def library(tmp_path):
+    for n in range(6):
+        (tmp_path / f'v{n}.mp4').write_bytes(b'x' * (n + 1))
+    return tmp_path
+
+# stub_scan: replace scan_video, records scanned file names
+def stub_scan(monkeypatch, result='border', fail=None):
+    seen: list[str] = []
+    def fake(path, p):
+        seen.append(os.path.basename(path))
+        if fail and fail(path):
+            raise fail.exc
+        return Verdict(result, Crop(70, 70, 0, 0) if result == 'border' else None, 1.0, 20), 'B'
+    monkeypatch.setattr(borders, 'scan_video', fake)
+    return seen
+
+def scan(lib, **kw):
+    run_scan(str(lib), workers=2, **kw)
+
+def load(lib):
+    return json.loads((lib / '.matcha' / 'borders.json').read_text())['videos']
+
+def test_scan_writes_store(library, monkeypatch):
+    stub_scan(monkeypatch)
+    scan(library)
+    v = load(library)
+    assert sorted(v) == [f'v{n}.mp4' for n in range(6)]
+    e = v['v0.mp4']
+    assert e['status'] == 'complete' and e['result'] == 'border' and e['crop'] == {'top': 70, 'bottom': 70, 'left': 0, 'right': 0}
+    assert e['size'] == 1 and e['params_hash'] == params_hash(P) and e['frames_used'] == 20
+
+def test_second_scan_skips_everything(library, monkeypatch):
+    seen = stub_scan(monkeypatch)
+    scan(library)
+    seen.clear()
+    scan(library)
+    assert seen == []
+
+def test_rescan_flag_scans_everything(library, monkeypatch):
+    seen = stub_scan(monkeypatch)
+    scan(library)
+    seen.clear()
+    scan(library, rescan=True)
+    assert len(seen) == 6
+
+def test_changed_size_or_mtime_rescans_that_file_only(library, monkeypatch):
+    seen = stub_scan(monkeypatch)
+    scan(library)
+    seen.clear()
+    (library / 'v1.mp4').write_bytes(b'longer content')
+    os.utime(library / 'v2.mp4', (1, 1))
+    scan(library)
+    assert sorted(seen) == ['v1.mp4', 'v2.mp4']
+
+def test_changed_param_rescans_all(library, monkeypatch):
+    seen = stub_scan(monkeypatch)
+    scan(library)
+    seen.clear()
+    scan(library, params=replace(P, agree_frac=0.9))
+    assert len(seen) == 6
+
+def test_workers_do_not_affect_hash(library, monkeypatch):
+    seen = stub_scan(monkeypatch)
+    run_scan(str(library), workers=1)
+    seen.clear()
+    run_scan(str(library), workers=3)
+    assert seen == []
+
+def test_pending_entries_are_rerun(library, monkeypatch):
+    seen = stub_scan(monkeypatch)
+    scan(library)
+    store = Store(str(library / '.matcha' / 'borders.json'))
+    store.videos['v3.mp4']['status'] = 'pending'
+    store.dirty = True
+    store.flush()
+    seen.clear()
+    scan(library)
+    assert seen == ['v3.mp4']
+
+def test_unreadable_file_recorded_and_scan_continues(library):
+    scan(library)  # real scan_video on junk files: ffprobe fails
+    v = load(library)
+    assert len(v) == 6 and {e['result'] for e in v.values()} == {'insufficient'}
+
+def test_worker_error_leaves_entry_pending(library, monkeypatch):
+    def fail(path):
+        return path.endswith('v2.mp4')
+    fail.exc = RuntimeError('boom')
+    stub_scan(monkeypatch, fail=fail)
+    scan(library)
+    v = load(library)
+    assert v['v2.mp4']['status'] == 'pending' and v['v0.mp4']['status'] == 'complete'
+
+def test_interrupt_keeps_store_valid_and_resumes(library, monkeypatch):
+    done: list[str] = []
+    def fake(path, p):
+        name = os.path.basename(path)
+        if name == 'v3.mp4':
+            raise KeyboardInterrupt
+        done.append(name)
+        return Verdict('no border', None, 1.0, 20), 'A'
+    monkeypatch.setattr(borders, 'scan_video', fake)
+    run_scan(str(library), workers=1)
+    v = load(library)  # valid JSON after the interrupt
+    complete = {n for n, e in v.items() if e['status'] == 'complete'}
+    assert 'v0.mp4' in complete and complete <= set(done) and v['v3.mp4']['status'] == 'pending'  # in-flight results may be lost
+    seen = stub_scan(monkeypatch)
+    scan(library)
+    assert not complete & set(seen) and 'v3.mp4' in seen
+    assert {e['status'] for e in load(library).values()} == {'complete'}
+
+def test_failed_replace_keeps_original_store(tmp_path, monkeypatch):
+    path = tmp_path / '.matcha' / 'borders.json'
+    s = Store(str(path))
+    s.put('a.mp4', {'status': 'complete'})
+    s.flush()
+    before = path.read_text()
+    s.put('b.mp4', {'status': 'complete'})
+    monkeypatch.setattr(os, 'replace', lambda *a: (_ for _ in ()).throw(OSError('crash')))
+    with pytest.raises(OSError):
+        s.flush()
+    monkeypatch.undo()
+    assert path.read_text() == before
+    (tmp_path / '.matcha' / 'borders.json.tmp').write_text('{half')  # stray temp from a real crash is ignored
+    assert list(Store(str(path)).videos) == ['a.mp4']
+
+def test_corrupt_store_moved_aside(library, monkeypatch):
+    (library / '.matcha').mkdir()
+    (library / '.matcha' / 'borders.json').write_text('{not json')
+    stub_scan(monkeypatch)
+    scan(library)
+    assert (library / '.matcha' / 'borders.json.corrupt').exists() and len(load(library)) == 6
+
+def test_only_main_thread_writes(library, monkeypatch):
+    stub_scan(monkeypatch)
+    threads = set()
+    for name in ('put', 'flush'):
+        orig = getattr(Store, name)
+        def spy(self, *a, _orig=orig, **k):
+            threads.add(threading.current_thread())
+            return _orig(self, *a, **k)
+        monkeypatch.setattr(Store, name, spy)
+    scan(library)
+    assert threads == {threading.main_thread()}
+
+def test_prune_forgets_vanished_files(library, monkeypatch):
+    stub_scan(monkeypatch)
+    scan(library)
+    (library / 'v0.mp4').unlink()
+    scan(library)
+    assert 'v0.mp4' in load(library)
+    scan(library, prune=True)
+    assert 'v0.mp4' not in load(library)
+
+def test_store_ignores_matcha_dir_and_uses_relative_keys(tmp_path, monkeypatch):
+    (tmp_path / 'sub').mkdir()
+    (tmp_path / 'sub' / 'a.mp4').write_bytes(b'x')
+    (tmp_path / '.matcha').mkdir()
+    (tmp_path / '.matcha' / 'skip.mp4').write_bytes(b'x')
+    stub_scan(monkeypatch)
+    scan(tmp_path)
+    assert list(load(tmp_path)) == [os.path.join('sub', 'a.mp4')]
+
+def test_cli_scan(library, monkeypatch):
+    stub_scan(monkeypatch)
+    r = CliRunner().invoke(app, ['borders', 'scan', str(library), '--workers', '2', '--agree-frac', '0.9'])
+    assert r.exit_code == 0, r.output
+    assert next(iter(load(library).values()))['params_hash'] == params_hash(replace(P, agree_frac=0.9))
+
+def test_cli_scan_missing_directory(tmp_path):
+    assert CliRunner().invoke(app, ['borders', 'scan', str(tmp_path / 'nope')]).exit_code == 1

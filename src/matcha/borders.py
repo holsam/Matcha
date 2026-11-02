@@ -3,11 +3,25 @@ MATCHA: detect near-black borders (letterbox, pillarbox, window-box) in sampled 
 '''
 
 # Import external dependencies
-import hashlib, json
+import hashlib, json, os, subprocess, time
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, astuple, dataclass
 from typing import Literal
 
 import numpy as np
+from rich.console import Console
+from rich.markup import escape
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
+
+# Import internal matcha objects
+from matcha.indexer import find_videos
+
+# _TIMEOUT: seconds before a slow disk or corrupt file is given up on
+_TIMEOUT = 30
+
+# _GRID: sample times are snapped to this many seconds, so very short clips are not sampled twice at one frame
+_GRID = 0.04
 
 # Result: the four per-video outcomes
 Result = Literal['border', 'no border', 'variable', 'insufficient']
@@ -107,6 +121,174 @@ def aggregate(
         return Verdict('variable', None, confidence, n)
     return Verdict('border', crop, confidence, n)
 
+# sample_frame: one greyscale frame at t seconds scaled to shape (height, width), None when ffmpeg cannot deliver it
+def sample_frame(path: str, t: float, shape: tuple[int, int]) -> np.ndarray | None:
+    h, w = shape
+    cmd = [
+        'ffmpeg', '-v', 'error', '-threads', '1', '-ss', f'{t:.3f}', '-i', path,  # seek before input, no full decode
+        '-frames:v', '1', '-an', '-sn', '-dn', '-vf', f'scale={w}:{h}', '-pix_fmt', 'gray', '-f', 'rawvideo', '-',
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=_TIMEOUT).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return np.frombuffer(out, np.uint8).reshape(h, w) if len(out) == h * w else None
+
+# scan_video: verdict for one video and the stage that decided it, A (few frames) or B (full sample)
+def scan_video(path: str, p: Params) -> tuple[Verdict, Literal['A', 'B']]:
+    dims = _dims(path)
+    if dims is None or dims[2] <= 0:
+        return Verdict('insufficient', None, 0.0, 0), 'A'
+    w, h, duration = dims
+    fw = min(w, p.max_width)
+    shape = (max(1, round(h * fw / w)), fw)
+    grid = _times(duration, p)
+    results: dict[int, FrameResult | None] = {}
+
+    # decide: sample any frames of idx not yet taken, then aggregate those frames
+    def decide(idx: list[int], min_informative: int) -> Verdict:
+        for i in idx:
+            if i not in results:
+                gray = sample_frame(path, grid[i], shape)
+                results[i] = None if gray is None else detect_frame(gray, p)
+        return aggregate([results[i] for i in idx], [grid[i] for i in idx], duration, p,
+                         source=(w, h), min_informative=min_informative)
+
+    a = sorted(set(np.linspace(0, len(grid) - 1, min(p.frames_a, len(grid))).round().astype(int).tolist()))
+    verdict = decide(a, p.min_informative_a)
+    if verdict.result == 'no border':
+        return verdict, 'A'
+    return decide(list(range(len(grid))), p.min_informative_b), 'B'
+
+# Store: the borders.json file, entries keyed by path relative to the scanned directory
+class Store:
+    # __init__: load the file, a corrupt one is moved aside to .corrupt and flagged in recovered
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.videos: dict[str, dict] = {}
+        self.recovered = False
+        self.dirty = False
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                videos = json.load(f)['videos']
+            if not isinstance(videos, dict):
+                raise TypeError('videos is not a mapping')
+            self.videos = videos
+        except (OSError, ValueError, KeyError, TypeError):
+            os.replace(path, path + '.corrupt')
+            self.recovered = True
+
+    # put: set one entry, in memory until the next flush
+    def put(self, rel: str, entry: dict) -> None:
+        self.videos[rel] = entry
+        self.dirty = True
+
+    # drop: remove one entry
+    def drop(self, rel: str) -> None:
+        del self.videos[rel]
+        self.dirty = True
+
+    # flush: write to a temp file then rename over the store, so an interrupted write never corrupts it
+    def flush(self) -> None:
+        if not self.dirty:
+            return
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump({'version': 1, 'videos': self.videos}, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+        self.dirty = False
+
+# run_scan: scan every video under directory, resumable; only this (main) thread touches the store
+def run_scan(
+    directory: str,
+    *,
+    params: Params = Params(),
+    workers: int = 4,
+    rescan: bool = False,
+    flush_every: float = 30.0,
+    prune: bool = False,
+) -> None:
+    console = Console()
+    root = os.path.abspath(directory)
+    keys = {os.path.relpath(p, root): p for p in find_videos(root)}
+    store = Store(os.path.join(root, '.matcha', 'borders.json'))
+    if store.recovered:
+        console.print(f'[yellow]Unreadable store moved to {escape(store.path)}.corrupt, starting again.[/yellow]')
+    if prune:
+        for rel in [k for k in store.videos if k not in keys]:
+            store.drop(rel)
+    ph = params_hash(params)
+    todo: deque[tuple[str, str, os.stat_result]] = deque()
+    for rel, path in keys.items():
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if rescan or not _fresh(store.videos.get(rel), st, ph):
+            todo.append((rel, path, st))
+    skipped = len(keys) - len(todo)
+    console.print(f'{len(keys)} videos, {skipped} up to date, {len(todo)} to scan')
+
+    counts: dict[str, int] = {'border': 0, 'no border': 0, 'variable': 0, 'insufficient': 0}
+    stage_b = 0
+    errors: list[tuple[str, Exception]] = []
+    interrupted = False
+    last_flush = time.monotonic()
+    progress = Progress(
+        SpinnerColumn(), BarColumn(), MofNCompleteColumn(), TextColumn('{task.fields[stats]}'), TimeRemainingColumn(),
+        console=console,
+    )
+    task = progress.add_task('Scanning', total=len(todo), stats='')
+    ex = ThreadPoolExecutor(max_workers=workers)
+    inflight: dict = {}
+    try:
+        with progress:
+            while todo or inflight:
+                while todo and len(inflight) < workers * 2:
+                    rel, path, st = todo.popleft()
+                    store.put(rel, _entry(st, ph))  # pending, so a crash leaves a visible trace
+                    inflight[ex.submit(scan_video, path, params)] = (rel, st)
+                done, _ = wait(inflight, timeout=1.0, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    rel, st = inflight.pop(fut)
+                    try:
+                        verdict, stage = fut.result()
+                    except Exception as exc:  # leave the entry pending so a re-run retries it
+                        errors.append((rel, exc))
+                    else:
+                        store.put(rel, _entry(st, ph, verdict))
+                        counts[verdict.result] += 1
+                        stage_b += stage == 'B'
+                    progress.update(
+                        task, advance=1,
+                        stats=f'border {counts["border"]} | variable {counts["variable"]} | stage B {stage_b}',
+                    )
+                if time.monotonic() - last_flush >= flush_every:
+                    store.flush()
+                    last_flush = time.monotonic()
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+        store.flush()
+    if interrupted:
+        console.print('\nStopped early. Progress saved, re-run `matcha borders scan` to resume.')
+    console.print(', '.join(f'{n} {r}' for r, n in counts.items()) + f'; {stage_b} needed stage B')
+    for rel, exc in errors[:5]:
+        console.print(f'[red]failed[/red] {escape(rel)}: {escape(repr(exc))}')
+    if errors:
+        console.print(f'{len(errors)} videos failed and stay pending')
+
 # snap_even: left and top floored to even, output size forced even by trimming at most 1 px from right or bottom
 def snap_even(crop: Crop, size: tuple[int, int]) -> Crop:
     w, h = size
@@ -143,3 +325,57 @@ def _scale(r: FrameResult, source: tuple[int, int]) -> Crop:
 # _close: every side of a and b within tol pixels
 def _close(a: Crop, b: Crop, tol: int) -> bool:
     return all(abs(x - y) <= tol for x, y in zip(astuple(a), astuple(b)))
+
+# _dims: displayed (width, height, duration) of the first video stream, rotation applied, None when ffprobe fails
+def _dims(path: str) -> tuple[int, int, float] | None:
+    cmd = [
+        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height,duration:stream_side_data=rotation:stream_tags=rotate:format=duration',
+        '-of', 'json', path,
+    ]
+    try:
+        data = json.loads(subprocess.run(cmd, capture_output=True, timeout=_TIMEOUT, check=True).stdout)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+    stream = (data.get('streams') or [{}])[0]
+    w, h = stream.get('width'), stream.get('height')
+    if not (w and h):
+        return None
+    rotation = next((s['rotation'] for s in stream.get('side_data_list') or [] if 'rotation' in s),
+                    (stream.get('tags') or {}).get('rotate', 0))
+    try:
+        if round(float(rotation)) % 180 == 90:  # ffmpeg autorotates, so frames come out turned
+            w, h = h, w
+    except (TypeError, ValueError):
+        pass
+    for raw in ((data.get('format') or {}).get('duration'), stream.get('duration')):
+        try:
+            return w, h, float(raw)
+        except (TypeError, ValueError):
+            continue
+    return w, h, 0.0
+
+# _times: stage B sample times, evenly across the span and snapped to _GRID
+def _times(duration: float, p: Params) -> list[float]:
+    lo, hi = p.span
+    return sorted({round(t / _GRID) * _GRID for t in duration * np.linspace(lo, hi, p.frames_b)})
+
+# _entry: store entry for a file, pending until a verdict is given
+def _entry(st: os.stat_result, ph: str, v: Verdict | None = None) -> dict:
+    return {
+        'size': st.st_size,
+        'mtime': st.st_mtime,
+        'params_hash': ph,
+        'status': 'pending' if v is None else 'complete',
+        'result': v and v.result,
+        'crop': v and v.crop and asdict(v.crop),
+        'confidence': v and round(v.confidence, 3),
+        'frames_used': v and v.frames_used,
+    }
+
+# _fresh: entry is complete and still matches the file and the params
+def _fresh(entry: dict | None, st: os.stat_result, ph: str) -> bool:
+    return bool(
+        entry and entry.get('status') == 'complete' and entry.get('size') == st.st_size
+        and entry.get('mtime') == st.st_mtime and entry.get('params_hash') == ph
+    )
