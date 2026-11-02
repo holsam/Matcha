@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 from matcha import reencode
 from matcha.cli import app
 from matcha.db import get_connection, init_schema
-from matcha.reencode import Info, Watch, _encode, _info, _parse_block, _summary, _candidates, _label, _precheck, _preview, _verify, _videos, run_reencode
+from matcha.reencode import Info, Watch, _encode, _info, _video_args, check_encoder, _parse_block, _summary, _candidates, _label, _precheck, _preview, _verify, _videos, run_reencode
 from matcha.review.media import Probe, probe
 
 # H264: 1080p30 at 8 Mbps for 100 s, about 0.13 bpp
@@ -259,3 +259,37 @@ def test_apply_prints_a_line_per_file_and_the_command_when_verbose(tmp_path, cap
     apply(tmp_path, verbose=True)
     out = capsys.readouterr().out
     assert 'a.mp4:' in out and ' to ' in out and 'ffmpeg -v error' in out
+
+def test_video_args_x265_uses_preset_and_the_given_rate():
+    assert _video_args('x265', 'fast', 1000) == ([], ['-c:v', 'libx265', '-preset', 'fast', '-b:v', '1000', '-x265-params', 'log-level=error'])
+
+def test_video_args_videotoolbox_scales_the_rate_and_has_no_preset():
+    pre, enc = _video_args('videotoolbox', 'fast', 1000)
+    assert pre == ['-hwaccel', 'videotoolbox']
+    assert enc == ['-c:v', 'hevc_videotoolbox', '-b:v', '1200']
+
+def test_check_encoder_rejects_unknown_names():
+    with pytest.raises(SystemExit, match="unknown encoder 'nvenc'"):
+        check_encoder('nvenc')
+
+# has_vt: whether this ffmpeg can encode with videotoolbox
+def has_vt() -> bool:
+    if shutil.which('ffmpeg') is None:
+        return False
+    try:
+        check_encoder('videotoolbox')
+    except SystemExit:
+        return False
+    return True
+
+needs_vt = pytest.mark.skipif(not has_vt(), reason='no hevc_videotoolbox encoder')
+
+@needs_vt
+def test_apply_with_videotoolbox_produces_hevc(tmp_path):
+    clip = make_clip(tmp_path / 'a.mp4')
+    apply(tmp_path, encoder='videotoolbox', verbose=True)
+    assert probe(str(clip)).codec == 'hevc'
+
+def test_run_reencode_fails_fast_on_an_unknown_encoder(tmp_path):
+    with pytest.raises(SystemExit, match='unknown encoder'):
+        run_reencode(str(tmp_path), encoder='nope')

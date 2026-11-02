@@ -116,6 +116,7 @@ def reencode(
     yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
     keep_originals: str | None = typer.Option(None, "--keep-originals", help="Move originals here, with a symlink to each new file, instead of deleting."),
     verbose: bool = typer.Option(False, "--verbose", help="Print each ffmpeg command."),
+    encoder: str = typer.Option("x265", help="HEVC encoder: x265 (software, best quality per bit) or videotoolbox (Apple hardware, much faster, larger files). --preset only applies to x265."),
 ):
     """Profile videos by codec and bitrate, and re-encode bloated ones to HEVC."""
     run_reencode(
@@ -132,6 +133,7 @@ def reencode(
         yes=yes,
         keep_originals=keep_originals,
         verbose=verbose,
+        encoder=encoder,
     )
 
 @borders_app.command()
@@ -199,9 +201,10 @@ def apply_borders(
     preset: str = typer.Option("fast", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
     keep_originals: str | None = typer.Option(None, "--keep-originals", help="Move originals here, with a symlink to each new file, instead of deleting."),
     verbose: bool = typer.Option(False, "--verbose", help="Print each ffmpeg command."),
+    encoder: str = typer.Option("x265", help="HEVC encoder: x265 (software, best quality per bit) or videotoolbox (Apple hardware, much faster, larger files). --preset only applies to x265."),
 ):
     """Crop videos with detected borders in place, re-encoded to HEVC. Originals are deleted immediately; check with `borders preview` first."""
-    raise SystemExit(run_apply(directory, min_confidence=min_confidence, only=only, preset=preset, keep_originals=keep_originals, verbose=verbose))
+    raise SystemExit(run_apply(directory, min_confidence=min_confidence, only=only, preset=preset, keep_originals=keep_originals, verbose=verbose, encoder=encoder))
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(

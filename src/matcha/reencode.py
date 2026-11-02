@@ -25,6 +25,12 @@ _HEVC_OK = {'.mp4', '.mkv', '.mov'}
 # _APPLE_TAG: containers that need the hvc1 tag for Apple players
 _APPLE_TAG = {'.mp4', '.mov'}
 
+# _ENCODERS: HEVC encoders --encoder accepts, x265 is software and videotoolbox is Apple's hardware encoder
+_ENCODERS = ('x265', 'videotoolbox')
+
+# _VT_RATE_SCALE: videotoolbox needs more bits than x265 for the same quality, so its bitrate is scaled up by this
+_VT_RATE_SCALE = 1.2
+
 # _BLOAT: a file is reported as bloated above this multiple of the bpp its codec needs
 _BLOAT = 1.5
 
@@ -205,13 +211,30 @@ def _summary(name: str, before: int, after: int, seconds: float) -> str:
     pct = (1 - after / before) * 100 if before else 0.0
     return f'{name}: {human_size(before)} to {human_size(after)} (-{pct:.0f}%) in {human_duration(seconds)}'
 
+# check_encoder: exit with a clear message when the encoder is unknown or this ffmpeg lacks it
+def check_encoder(encoder: str) -> None:
+    if encoder not in _ENCODERS:
+        raise SystemExit(f'unknown encoder {encoder!r}, choose from {", ".join(_ENCODERS)}')
+    if encoder == 'videotoolbox':
+        out = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True).stdout
+        if 'hevc_videotoolbox' not in out:
+            raise SystemExit('this ffmpeg has no hevc_videotoolbox encoder')
+
+# _video_args: the ffmpeg options that select the video encoder and its rate
+# videotoolbox has no presets and takes a scaled-up rate, and decodes on the hardware where it can (ffmpeg falls back to software)
+def _video_args(encoder: str, preset: str, rate: int) -> tuple[list[str], list[str]]:
+    if encoder == 'videotoolbox':
+        return ['-hwaccel', 'videotoolbox'], ['-c:v', 'hevc_videotoolbox', '-b:v', str(int(rate * _VT_RATE_SCALE))]
+    return [], ['-c:v', 'libx265', '-preset', preset, '-b:v', str(rate), '-x265-params', 'log-level=error']
+
 # _encode: re-encode to tmp at bpp keeping audio and subtitles, returns ffmpeg's last error line or None on success
 # vf adds a video filter (such as a crop) and rate overrides the bitrate derived from bpp
-def _encode(i: Info, tmp: str, bpp: float, preset: str, *, vf: str | None = None, rate: int | None = None, watch: Watch | None = None) -> str | None:
+def _encode(i: Info, tmp: str, bpp: float, preset: str, *, vf: str | None = None, rate: int | None = None, watch: Watch | None = None, encoder: str = 'x265') -> str | None:
     rate = rate or int(i.width * i.height * i.fps * bpp)
-    cmd = ['ffmpeg', '-v', 'error', '-y', '-progress', 'pipe:1', '-nostats', '-i', i.path, '-map', '0:v:0', '-map', '0:a?', '-map', '0:s?',
+    pre, enc = _video_args(encoder, preset, rate)
+    cmd = ['ffmpeg', '-v', 'error', '-y', '-progress', 'pipe:1', '-nostats', *pre, '-i', i.path, '-map', '0:v:0', '-map', '0:a?', '-map', '0:s?',
            *(['-vf', vf] if vf else []),
-           '-c', 'copy', '-c:v', 'libx265', '-preset', preset, '-b:v', str(rate), '-x265-params', 'log-level=error']
+           '-c', 'copy', *enc]
     if os.path.splitext(tmp)[1].lower() in _APPLE_TAG:
         cmd += ['-tag:v', 'hvc1']
     cmd.append(tmp)
@@ -246,11 +269,11 @@ def _verify(old: Info, tmp: str) -> str | None:
     return None
 
 # _reencode_one: encode beside the original, verify, then swap it in; returns (bytes saved, reason skipped)
-def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str, held: str | None, watch: Watch | None = None) -> tuple[int, str]:
+def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str, held: str | None, watch: Watch | None = None, *, encoder: str = 'x265') -> tuple[int, str]:
     dst = _target(i.path)
     tmp = f'{os.path.splitext(i.path)[0]}.reencoding{os.path.splitext(dst)[1]}'
     try:
-        reason = _precheck(i, dst, held) or _encode(i, tmp, bpp, preset, watch=watch) or _verify(i, tmp)
+        reason = _precheck(i, dst, held) or _encode(i, tmp, bpp, preset, watch=watch, encoder=encoder) or _verify(i, tmp)
         if reason:
             return 0, reason
         saved = i.size - os.path.getsize(tmp)
@@ -316,7 +339,9 @@ def run_reencode(
     yes: bool = False,
     keep_originals: str | None = None,
     verbose: bool = False,
+    encoder: str = 'x265',
 ) -> None:
+    check_encoder(encoder)
     directory = os.path.abspath(directory)
     keep = os.path.abspath(keep_originals) if keep_originals else None
     console = Console()
@@ -353,7 +378,7 @@ def run_reencode(
             held = os.path.join(keep, os.path.relpath(i.path, directory)) if keep else None
             task, watch = _file_task(progress, os.path.relpath(i.path, directory), verbose)
             start = time.monotonic()
-            gained, reason = _reencode_one(i, db_path, bpp, preset, held, watch)
+            gained, reason = _reencode_one(i, db_path, bpp, preset, held, watch, encoder=encoder)
             progress.remove_task(task)
             progress.update(overall, advance=1, stats=f'{n + 1}/{len(cands)} files')
             saved += gained

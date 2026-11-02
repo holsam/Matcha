@@ -20,7 +20,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn
 # Import internal matcha objects
 from matcha.db import fold_in_moved_paths
 from matcha.indexer import find_videos
-from matcha.reencode import _CODEC_SCALE, _DEFAULT_SCALE, Info, Watch, _encode, _file_task, _info, _precheck, _progress, _summary, _swap_in, _target
+from matcha.reencode import _CODEC_SCALE, _DEFAULT_SCALE, Info, Watch, _encode, _file_task, _info, _precheck, _progress, _summary, _swap_in, _target, check_encoder
 from matcha.review.media import human_size
 
 # _TIMEOUT: seconds before a slow disk or corrupt file is given up on
@@ -414,7 +414,9 @@ def run_apply(
     keep_originals: str | None = None,
     flush_every: float = 30.0,
     verbose: bool = False,
+    encoder: str = 'x265',
 ) -> int:
+    check_encoder(encoder)
     console = Console()
     root = os.path.abspath(directory)
     keep = os.path.abspath(keep_originals) if keep_originals else None
@@ -451,7 +453,7 @@ def run_apply(
                 held = os.path.join(keep, rel) if keep else None
                 task, watch = _file_task(progress, rel, verbose)
                 start = time.monotonic()
-                new_path, sizes, reason = _crop_one(path, Crop(**e['crop']), preset, held, db_path, watch)
+                new_path, sizes, reason = _crop_one(path, Crop(**e['crop']), preset, held, db_path, watch, encoder=encoder)
                 progress.remove_task(task)
                 progress.update(overall, advance=1, stats=f'{n + 1}/{len(todo)} files')
                 if reason:
@@ -617,7 +619,7 @@ def _grab(path: str, t: float, out: str) -> bool:
     return os.path.exists(out)
 
 # _crop_one: crop and re-encode one file beside the original, verify, swap it in; returns (new path, (size before, after), reason skipped)
-def _crop_one(path: str, crop: Crop, preset: str, held: str | None, db_path: str | None, watch: Watch | None = None) -> tuple[str, tuple[int, int], str]:
+def _crop_one(path: str, crop: Crop, preset: str, held: str | None, db_path: str | None, watch: Watch | None = None, *, encoder: str = 'x265') -> tuple[str, tuple[int, int], str]:
     fail = (path, (0, 0))
     i, dims = _info(path), _dims(path)
     if i is None or dims is None:
@@ -632,7 +634,7 @@ def _crop_one(path: str, crop: Crop, preset: str, held: str | None, db_path: str
     dst = _target(path)
     tmp = f'{os.path.splitext(path)[0]}.reencoding{os.path.splitext(dst)[1]}'
     try:
-        reason = (_precheck(i, dst, held) or _encode(i, tmp, 0, preset, vf=f'crop={ow}:{oh}:{crop.left}:{crop.top}', rate=rate, watch=watch)
+        reason = (_precheck(i, dst, held) or _encode(i, tmp, 0, preset, vf=f'crop={ow}:{oh}:{crop.left}:{crop.top}', rate=rate, watch=watch, encoder=encoder)
                   or _verify_crop(i, tmp, ow, oh))
         if reason:
             return *fail, reason
