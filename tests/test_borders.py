@@ -661,7 +661,7 @@ def test_apply_keep_originals(tmp_path):
 # stub_crop: replace _crop_one, records the paths it is asked to crop
 def stub_crop(monkeypatch, reason=''):
     asked: list[str] = []
-    def fake(path, crop, preset, held, db_path):
+    def fake(path, crop, preset, held, db_path, watch=None):
         asked.append(os.path.basename(path))
         return path, (10, 5), reason
     monkeypatch.setattr(borders, '_crop_one', fake)

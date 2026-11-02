@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 from matcha import reencode
 from matcha.cli import app
 from matcha.db import get_connection, init_schema
-from matcha.reencode import Info, _info, _candidates, _label, _precheck, _preview, _verify, _videos, run_reencode
+from matcha.reencode import Info, Watch, _encode, _info, _parse_block, _summary, _candidates, _label, _precheck, _preview, _verify, _videos, run_reencode
 from matcha.review.media import Probe, probe
 
 # H264: 1080p30 at 8 Mbps for 100 s, about 0.13 bpp
@@ -225,3 +225,37 @@ def test_precheck_skips_files_with_several_video_streams(tmp_path):
     before = two.read_bytes()
     apply(tmp_path)
     assert two.read_bytes() == before
+
+def test_parse_block_reads_time_fps_and_speed():
+    assert _parse_block({'out_time_us': '2500000', 'fps': '48.2', 'speed': '1.9x'}) == (2.5, 48.2, '1.9x')
+
+def test_parse_block_tolerates_the_first_blocks():
+    assert _parse_block({'out_time_us': 'N/A', 'fps': '0.00', 'speed': 'N/A'}) is None
+    assert _parse_block({'out_time_us': '-5', 'fps': 'N/A'}) == (0.0, 0.0, 'N/A')
+
+def test_summary_gives_sizes_saving_and_time():
+    assert _summary('a.mp4', 2048, 1024, 65) == 'a.mp4: 2.0 KB to 1.0 KB (-50%) in 1:05'
+
+@needs_ffmpeg
+def test_encode_reports_progress_and_echoes_the_command(tmp_path):
+    clip = make_clip(tmp_path / 'a.mp4')
+    seen: list[tuple[float, float]] = []
+    cmds: list[str] = []
+    watch = Watch(lambda done, total, fps, speed: seen.append((done, total)), cmds.append)
+    assert _encode(_info(str(clip)), str(tmp_path / 'out.mp4'), 0.06, 'ultrafast', watch=watch) is None
+    assert seen and seen[-1][1] == pytest.approx(2, abs=0.2) and seen[-1][0] <= seen[-1][1] + 0.1
+    assert len(cmds) == 1 and 'libx265' in cmds[0] and '-progress' in cmds[0]
+
+@needs_ffmpeg
+def test_encode_returns_the_last_error_line(tmp_path):
+    bad = tmp_path / 'bad.mp4'
+    bad.write_bytes(b'not a video')
+    info = replace(H264, path=str(bad))
+    assert _encode(info, str(tmp_path / 'out.mp4'), 0.06, 'ultrafast')
+
+@needs_ffmpeg
+def test_apply_prints_a_line_per_file_and_the_command_when_verbose(tmp_path, capsys):
+    make_clip(tmp_path / 'a.mp4')
+    apply(tmp_path, verbose=True)
+    out = capsys.readouterr().out
+    assert 'a.mp4:' in out and ' to ' in out and 'ffmpeg -v error' in out

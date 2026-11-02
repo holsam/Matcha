@@ -15,13 +15,12 @@ from PIL import Image, ImageDraw
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
-from rich.progress import track
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
 # Import internal matcha objects
 from matcha.db import fold_in_moved_paths
 from matcha.indexer import find_videos
-from matcha.reencode import _CODEC_SCALE, _DEFAULT_SCALE, Info, _encode, _info, _precheck, _swap_in, _target
+from matcha.reencode import _CODEC_SCALE, _DEFAULT_SCALE, Info, Watch, _encode, _file_task, _info, _precheck, _progress, _summary, _swap_in, _target
 from matcha.review.media import human_size
 
 # _TIMEOUT: seconds before a slow disk or corrupt file is given up on
@@ -414,6 +413,7 @@ def run_apply(
     preset: str = 'fast',
     keep_originals: str | None = None,
     flush_every: float = 30.0,
+    verbose: bool = False,
 ) -> int:
     console = Console()
     root = os.path.abspath(directory)
@@ -445,26 +445,33 @@ def run_apply(
     before = after = done = 0
     last_flush = time.monotonic()
     try:
-        for rel, path, e in track(todo, description='Cropping', console=console):
-            held = os.path.join(keep, rel) if keep else None
-            new_path, sizes, reason = _crop_one(path, Crop(**e['crop']), preset, held, db_path)
-            if reason:
-                console.print(escape(f'skipped {rel}: {reason}'), style='yellow')
-                continue
-            new_rel = os.path.relpath(new_path, root)
-            st = os.stat(new_path)
-            if new_rel != rel:
-                store.drop(rel)
-            store.put(new_rel, {
-                **e, 'size': st.st_size, 'mtime': st.st_mtime, 'result': 'no border', 'crop': None,
-                'applied': {'crop': e['crop'], 'at': datetime.now(timezone.utc).isoformat(), 'original_size': sizes[0]},
-            })
-            before += sizes[0]
-            after += sizes[1]
-            done += 1
-            if time.monotonic() - last_flush >= flush_every:
-                store.flush()
-                last_flush = time.monotonic()
+        with _progress(console) as progress:
+            overall = progress.add_task('Cropping'.ljust(40), total=len(todo), stats='')
+            for n, (rel, path, e) in enumerate(todo):
+                held = os.path.join(keep, rel) if keep else None
+                task, watch = _file_task(progress, rel, verbose)
+                start = time.monotonic()
+                new_path, sizes, reason = _crop_one(path, Crop(**e['crop']), preset, held, db_path, watch)
+                progress.remove_task(task)
+                progress.update(overall, advance=1, stats=f'{n + 1}/{len(todo)} files')
+                if reason:
+                    progress.console.print(escape(f'skipped {rel}: {reason}'), style='yellow')
+                    continue
+                progress.console.print(escape(_summary(rel, sizes[0], sizes[1], time.monotonic() - start)))
+                new_rel = os.path.relpath(new_path, root)
+                st = os.stat(new_path)
+                if new_rel != rel:
+                    store.drop(rel)
+                store.put(new_rel, {
+                    **e, 'size': st.st_size, 'mtime': st.st_mtime, 'result': 'no border', 'crop': None,
+                    'applied': {'crop': e['crop'], 'at': datetime.now(timezone.utc).isoformat(), 'original_size': sizes[0]},
+                })
+                before += sizes[0]
+                after += sizes[1]
+                done += 1
+                if time.monotonic() - last_flush >= flush_every:
+                    store.flush()
+                    last_flush = time.monotonic()
     finally:
         store.flush()
     console.print(f'[bold green]{done}[/]/{len(todo)} cropped, {human_size(before)} to {human_size(after)}')
@@ -610,7 +617,7 @@ def _grab(path: str, t: float, out: str) -> bool:
     return os.path.exists(out)
 
 # _crop_one: crop and re-encode one file beside the original, verify, swap it in; returns (new path, (size before, after), reason skipped)
-def _crop_one(path: str, crop: Crop, preset: str, held: str | None, db_path: str | None) -> tuple[str, tuple[int, int], str]:
+def _crop_one(path: str, crop: Crop, preset: str, held: str | None, db_path: str | None, watch: Watch | None = None) -> tuple[str, tuple[int, int], str]:
     fail = (path, (0, 0))
     i, dims = _info(path), _dims(path)
     if i is None or dims is None:
@@ -625,7 +632,7 @@ def _crop_one(path: str, crop: Crop, preset: str, held: str | None, db_path: str
     dst = _target(path)
     tmp = f'{os.path.splitext(path)[0]}.reencoding{os.path.splitext(dst)[1]}'
     try:
-        reason = (_precheck(i, dst, held) or _encode(i, tmp, 0, preset, vf=f'crop={ow}:{oh}:{crop.left}:{crop.top}', rate=rate)
+        reason = (_precheck(i, dst, held) or _encode(i, tmp, 0, preset, vf=f'crop={ow}:{oh}:{crop.left}:{crop.top}', rate=rate, watch=watch)
                   or _verify_crop(i, tmp, ow, oh))
         if reason:
             return *fail, reason

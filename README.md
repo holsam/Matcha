@@ -257,6 +257,7 @@ Separating the decisions from the file changes lets you review a whole library o
 | `--preset` | `fast` | x265 preset, `ultrafast` to `veryslow`. Faster presets give larger files |
 | `--yes` | off | Skip the confirmation prompt |
 | `--keep-originals` | none | Move originals to this directory, with a symlink to each new file, instead of deleting them |
+| `--verbose` | off | Print each ffmpeg command above the progress display |
 
 ```sh
 # Profile the library and list the biggest savings
@@ -323,6 +324,7 @@ Takes a video path. Saves a frame with the crop box drawn in red to `.matcha/tmp
 | `--only` | none | Only crop videos whose path (relative to the directory) matches this glob |
 | `--preset` | `fast` | x265 preset, `ultrafast` to `veryslow` |
 | `--keep-originals` | none | Move originals to this directory, with a symlink to each new file, instead of deleting them |
+| `--verbose` | off | Print each ffmpeg command above the progress display |
 
 ```sh
 # Look at what would be cropped, then crop it
