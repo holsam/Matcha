@@ -293,3 +293,11 @@ def test_apply_with_videotoolbox_produces_hevc(tmp_path):
 def test_run_reencode_fails_fast_on_an_unknown_encoder(tmp_path):
     with pytest.raises(SystemExit, match='unknown encoder'):
         run_reencode(str(tmp_path), encoder='nope')
+
+def test_hevc_already_at_the_target_bpp_is_not_a_candidate():
+    lean = replace(H264, codec='hevc', vbitrate=int(1920 * 1080 * 30 * 0.05))
+    assert _candidates([lean], 0.06, min_saving_pct=1, min_saving_mb=1) == []
+
+def test_hevc_above_the_target_bpp_is_a_candidate():
+    fat = replace(H264, codec='hevc')
+    assert [i for _, i in _candidates([fat], 0.06, min_saving_pct=1, min_saving_mb=1)] == [fat]

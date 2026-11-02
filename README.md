@@ -345,6 +345,8 @@ Results are kept in `.matcha/borders.json`, separate from the index, and saved a
 
 **There is no dry run, and the original is deleted** once the new file verifies, unless `--keep-originals` is given. Use `list` and `preview` first. Keep the `--keep-originals` directory outside the scanned directory, or a later `scan` will flag the held originals again.
 
+Crops whose widest margin is 2 px or less are skipped, as they save too little to justify a re-encode.
+
 ### `matcha continue`
 #### CLI options and usage
 | Option | Default | Description |

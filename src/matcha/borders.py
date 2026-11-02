@@ -29,6 +29,9 @@ _TIMEOUT = 30
 # _GRID: sample times are snapped to this many seconds, so very short clips are not sampled twice at one frame
 _GRID = 0.04
 
+# _MIN_CROP: a crop whose widest margin is at most this many pixels saves too little to be worth a re-encode
+_MIN_CROP = 2
+
 # Result: the four per-video outcomes
 Result = Literal['border', 'no border', 'variable', 'insufficient']
 
@@ -621,6 +624,8 @@ def _grab(path: str, t: float, out: str) -> bool:
 # _crop_one: crop and re-encode one file beside the original, verify, swap it in; returns (new path, (size before, after), reason skipped)
 def _crop_one(path: str, crop: Crop, preset: str, held: str | None, db_path: str | None, watch: Watch | None = None, *, encoder: str = 'x265') -> tuple[str, tuple[int, int], str]:
     fail = (path, (0, 0))
+    if max(astuple(crop)) <= _MIN_CROP:
+        return *fail, f'widest margin is {max(astuple(crop))} px, not worth a re-encode'
     i, dims = _info(path), _dims(path)
     if i is None or dims is None:
         return *fail, 'unreadable'
