@@ -2,7 +2,7 @@ import os, subprocess, sys
 import typer
 
 from matcha.apply import run as run_apply
-from matcha.borders import Params, run_list, run_preview, run_scan
+from matcha.borders import Params, run_apply, run_list, run_preview, run_scan
 from matcha.continuer import run_continue
 from matcha.db import fold_in_moved_paths, init_schema
 from matcha.plan import run_plan
@@ -188,6 +188,17 @@ def preview(
 ):
     """Save a frame with the proposed crop box drawn on it."""
     raise SystemExit(run_preview(path, at=at, out=out, detect=detect))
+
+@borders_app.command(name="apply")
+def apply_borders(
+    directory: str = typer.Argument(..., help="Directory containing .matcha/borders.json."),
+    min_confidence: float = typer.Option(0.0, help="Only crop videos where at least this share of frames agreed (0.0-1.0)."),
+    only: str | None = typer.Option(None, "--only", help="Only crop videos whose path (relative to DIRECTORY) matches this glob."),
+    preset: str = typer.Option("medium", help="x265 preset, ultrafast to veryslow. Faster presets give larger files."),
+    keep_originals: str | None = typer.Option(None, "--keep-originals", help="Move originals here, with a symlink to each new file, instead of deleting."),
+):
+    """Crop videos with detected borders in place, re-encoded to HEVC. Originals are deleted immediately; check with `borders preview` first."""
+    raise SystemExit(run_apply(directory, min_confidence=min_confidence, only=only, preset=preset, keep_originals=keep_originals))
 
 @app.command(name="continue", rich_help_panel="Identify matches")
 def continue_(

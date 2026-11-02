@@ -3,7 +3,8 @@ MATCHA: detect near-black borders (letterbox, pillarbox, window-box) in sampled 
 '''
 
 # Import external dependencies
-import hashlib, json, os, subprocess, time
+import fnmatch, hashlib, json, os, subprocess, time
+from datetime import datetime, timezone
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, astuple, dataclass
@@ -14,10 +15,14 @@ from PIL import Image, ImageDraw
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.progress import track
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
 # Import internal matcha objects
+from matcha.db import fold_in_moved_paths
 from matcha.indexer import find_videos
+from matcha.reencode import _CODEC_SCALE, _DEFAULT_SCALE, Info, _encode, _info, _precheck, _swap_in, _target
+from matcha.review.media import human_size
 
 # _TIMEOUT: seconds before a slow disk or corrupt file is given up on
 _TIMEOUT = 30
@@ -400,6 +405,71 @@ def run_preview(path: str, *, at: float | None = None, out: str | None = None, d
     print(out)
     return 0
 
+# run_apply: crop every stored 'border' video in place to HEVC, deleting (or holding) the original, returns the exit code
+def run_apply(
+    directory: str,
+    *,
+    min_confidence: float = 0.0,
+    only: str | None = None,
+    preset: str = 'medium',
+    keep_originals: str | None = None,
+    flush_every: float = 30.0,
+) -> int:
+    console = Console()
+    root = os.path.abspath(directory)
+    keep = os.path.abspath(keep_originals) if keep_originals else None
+    store = Store(os.path.join(root, '.matcha', 'borders.json'))
+    todo = []
+    for rel, e in sorted(store.videos.items()):
+        if e.get('status') != 'complete' or e.get('result') != 'border' or not e.get('crop'):
+            continue
+        if (e.get('confidence') or 0) < min_confidence or (only and not fnmatch.fnmatch(rel, only)):
+            continue
+        path = os.path.join(root, rel)
+        try:
+            st = os.stat(path)
+        except OSError:
+            console.print(escape(f'skipped {rel}: file is missing'), style='yellow')
+            continue
+        if (e.get('size'), e.get('mtime')) != (st.st_size, st.st_mtime):
+            console.print(escape(f'skipped {rel}: changed since the scan, scan again'), style='yellow')
+            continue
+        todo.append((rel, path, e))
+    if not todo:
+        console.print('Nothing to crop. `matcha borders list` shows what the store holds.')
+        return 0
+    db = os.path.join(root, '.matcha', 'index.db')
+    db_path = db if os.path.exists(db) else None
+    if db_path:
+        fold_in_moved_paths(db_path)
+    before = after = done = 0
+    last_flush = time.monotonic()
+    try:
+        for rel, path, e in track(todo, description='Cropping', console=console):
+            held = os.path.join(keep, rel) if keep else None
+            new_path, sizes, reason = _crop_one(path, Crop(**e['crop']), preset, held, db_path)
+            if reason:
+                console.print(escape(f'skipped {rel}: {reason}'), style='yellow')
+                continue
+            new_rel = os.path.relpath(new_path, root)
+            st = os.stat(new_path)
+            if new_rel != rel:
+                store.drop(rel)
+            store.put(new_rel, {
+                **e, 'size': st.st_size, 'mtime': st.st_mtime, 'result': 'no border', 'crop': None,
+                'applied': {'crop': e['crop'], 'at': datetime.now(timezone.utc).isoformat(), 'original_size': sizes[0]},
+            })
+            before += sizes[0]
+            after += sizes[1]
+            done += 1
+            if time.monotonic() - last_flush >= flush_every:
+                store.flush()
+                last_flush = time.monotonic()
+    finally:
+        store.flush()
+    console.print(f'[bold green]{done}[/]/{len(todo)} cropped, {human_size(before)} to {human_size(after)}')
+    return 0
+
 # snap_even: left and top floored to even, output size forced even by trimming at most 1 px from right or bottom
 def snap_even(crop: Crop, size: tuple[int, int]) -> Crop:
     w, h = size
@@ -538,3 +608,43 @@ def _grab(path: str, t: float, out: str) -> bool:
     except (subprocess.SubprocessError, OSError):
         return False
     return os.path.exists(out)
+
+# _crop_one: crop and re-encode one file beside the original, verify, swap it in; returns (new path, (size before, after), reason skipped)
+def _crop_one(path: str, crop: Crop, preset: str, held: str | None, db_path: str | None) -> tuple[str, tuple[int, int], str]:
+    fail = (path, (0, 0))
+    i, dims = _info(path), _dims(path)
+    if i is None or dims is None:
+        return *fail, 'unreadable'
+    ow, oh = dims[0] - crop.left - crop.right, dims[1] - crop.top - crop.bottom
+    if ow <= 0 or oh <= 0 or ow % 2 or oh % 2 or crop.left % 2 or crop.top % 2:
+        return *fail, f'crop box {crop} does not give an even {dims[0]}x{dims[1]} output'
+    if not i.bpp:
+        return *fail, 'bitrate unknown'
+    # hevc needs fewer bits than the source codec for the same quality, so scale the source's bits per pixel down
+    rate = int(ow * oh * i.fps * i.bpp / _CODEC_SCALE.get(i.codec, _DEFAULT_SCALE))
+    dst = _target(path)
+    tmp = f'{os.path.splitext(path)[0]}.reencoding{os.path.splitext(dst)[1]}'
+    try:
+        reason = (_precheck(i, dst, held) or _encode(i, tmp, 0, preset, vf=f'crop={ow}:{oh}:{crop.left}:{crop.top}', rate=rate)
+                  or _verify_crop(i, tmp, ow, oh))
+        if reason:
+            return *fail, reason
+        size = os.path.getsize(tmp)
+        _swap_in(path, tmp, dst, held, db_path)
+        return dst, (i.size, size), ''
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+# _verify_crop: why the cropped file cannot replace the original, or None when it is hevc, the same length and the expected size
+def _verify_crop(old: Info, tmp: str, ow: int, oh: int) -> str | None:
+    new = _info(tmp)
+    if new is None:
+        return 'output unreadable'
+    if new.codec != 'hevc':
+        return f'output is {new.codec}'
+    if abs(new.duration - old.duration) > 1:
+        return f'duration {new.duration:.1f}s vs {old.duration:.1f}s'
+    if (new.width, new.height) != (ow, oh):
+        return f'output is {new.width}x{new.height}, expected {ow}x{oh}'
+    return None

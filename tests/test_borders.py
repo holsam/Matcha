@@ -597,3 +597,129 @@ def test_cli_preview(tmp_path, monkeypatch):
     out = tmp_path / 'o.png'
     r = CliRunner().invoke(app, ['borders', 'preview', str(stored_video(tmp_path)), '--out', str(out), '--at', '3'])
     assert r.exit_code == 0 and out.exists()
+
+
+# ---- phase 5: apply ----
+
+from matcha.borders import run_apply
+from matcha.db import get_connection, init_schema
+from matcha.review.media import probe
+
+# scanned_clip: library holding one letterboxed clip that has been scanned
+def scanned_clip(tmp_path, name='a.mp4', *extra):
+    lib = tmp_path / 'lib'
+    lib.mkdir(exist_ok=True)
+    clip(lib / name, 'pad=640:480:0:60:black', extra=extra)
+    run_scan(str(lib), workers=1)
+    return lib
+
+@needs_ffmpeg
+def test_apply_crops_in_place_and_marks_store(tmp_path):
+    lib = scanned_clip(tmp_path)
+    mtime = os.stat(lib / 'a.mp4').st_mtime
+    assert run_apply(str(lib), preset='ultrafast') == 0
+    p = probe(str(lib / 'a.mp4'))
+    assert (p.codec, p.width, p.height) == ('hevc', 640, 360)
+    assert os.stat(lib / 'a.mp4').st_mtime == pytest.approx(mtime, abs=1)  # original times kept
+    e = load(lib)['a.mp4']
+    assert e['result'] == 'no border' and e['crop'] is None and e['applied']['crop']['top'] in (58, 60, 62)
+    assert e['size'] == os.path.getsize(lib / 'a.mp4') and e['status'] == 'complete'
+    assert not [f for f in os.listdir(lib) if 'reencoding' in f]
+
+@needs_ffmpeg
+def test_apply_then_scan_and_apply_again_is_a_no_op(tmp_path, capsys):
+    lib = scanned_clip(tmp_path)
+    run_apply(str(lib), preset='ultrafast')
+    size = os.path.getsize(lib / 'a.mp4')
+    run_scan(str(lib), workers=1)  # entry matches the new size and mtime, so it is skipped
+    run_apply(str(lib), preset='ultrafast')
+    assert os.path.getsize(lib / 'a.mp4') == size and 'Nothing to crop' in capsys.readouterr().out
+
+@needs_ffmpeg
+def test_apply_container_change_renames_store_key_and_index(tmp_path):
+    lib = scanned_clip(tmp_path, 'old.avi', '-c:v', 'mpeg4')
+    db = lib / '.matcha' / 'index.db'
+    init_schema(str(db))
+    conn = get_connection(str(db))
+    with conn:
+        conn.execute('INSERT INTO videos (id, path, duration, content_key) VALUES (1, ?, 6, ?)', (str(lib / 'old.avi'), 'k'))
+    run_apply(str(lib), preset='ultrafast')
+    assert not (lib / 'old.avi').exists() and (lib / 'old.mkv').exists()
+    assert list(load(lib)) == ['old.mkv']
+    row = get_connection(str(db)).execute('SELECT path, content_key FROM videos').fetchone()
+    assert (row[0], row[1]) == (str(lib / 'old.mkv'), None)
+
+@needs_ffmpeg
+def test_apply_keep_originals(tmp_path):
+    lib = scanned_clip(tmp_path)
+    keep = tmp_path / 'keep'
+    before = os.path.getsize(lib / 'a.mp4')
+    run_apply(str(lib), preset='ultrafast', keep_originals=str(keep))
+    assert os.path.getsize(keep / 'a.mp4') == before
+    assert os.path.realpath(keep / 'a.reencoded.mp4') == os.path.realpath(lib / 'a.mp4')
+
+# stub_crop: replace _crop_one, records the paths it is asked to crop
+def stub_crop(monkeypatch, reason=''):
+    asked: list[str] = []
+    def fake(path, crop, preset, held, db_path):
+        asked.append(os.path.basename(path))
+        return path, (10, 5), reason
+    monkeypatch.setattr(borders, '_crop_one', fake)
+    return asked
+
+# fresh_store: seed_store rows with size and mtime matching the files on disk
+def fresh_store(lib, rows):
+    seed_store(lib, rows)
+    data = json.loads((lib / '.matcha' / 'borders.json').read_text())
+    for rel, e in data['videos'].items():
+        st = os.stat(lib / rel)
+        e.update(size=st.st_size, mtime=st.st_mtime)
+    (lib / '.matcha' / 'borders.json').write_text(json.dumps(data))
+
+def test_apply_only_acts_on_border_results(tmp_path, monkeypatch):
+    fresh_store(tmp_path, ROWS)
+    asked = stub_crop(monkeypatch)
+    run_apply(str(tmp_path))
+    assert asked == ['a.mp4', 'b.mp4', 'e.mp4']  # never variable, no border or pending
+
+def test_apply_min_confidence_and_only_glob(tmp_path, monkeypatch):
+    fresh_store(tmp_path, ROWS)
+    asked = stub_crop(monkeypatch)
+    run_apply(str(tmp_path), min_confidence=0.9)
+    assert asked == ['a.mp4', 'b.mp4']
+    asked.clear()
+    run_apply(str(tmp_path), only='e*')
+    assert asked == ['e.mp4']
+
+def test_apply_skips_changed_and_missing_files(tmp_path, monkeypatch, capsys):
+    fresh_store(tmp_path, ROWS)
+    (tmp_path / 'a.mp4').write_bytes(b'changed length')
+    (tmp_path / 'b.mp4').unlink()
+    asked = stub_crop(monkeypatch)
+    run_apply(str(tmp_path))
+    out = capsys.readouterr().out
+    assert asked == ['e.mp4'] and 'changed since the scan' in out and 'file is missing' in out
+
+def test_apply_skipped_file_leaves_store_entry(tmp_path, monkeypatch):
+    fresh_store(tmp_path, ROWS)
+    stub_crop(monkeypatch, reason='output is h264')
+    run_apply(str(tmp_path))
+    assert load(tmp_path)['a.mp4']['result'] == 'border' and 'applied' not in load(tmp_path)['a.mp4']
+
+def test_apply_nothing_to_do(tmp_path, capsys):
+    assert run_apply(str(tmp_path)) == 0
+    assert 'Nothing to crop' in capsys.readouterr().out
+
+@needs_ffmpeg
+@pytest.mark.parametrize('crop', [Crop(3, 0, 0, 0), Crop(0, 1, 0, 0), Crop(0, 0, 0, 1), Crop(0, 0, 0, 641), Crop(0, 359, 0, 0)])
+def test_crop_one_refuses_bad_boxes(tmp_path, crop):
+    video = clip(tmp_path / 'a.mp4')  # 640x360, no border
+    _, _, reason = borders._crop_one(str(video), crop, 'ultrafast', None, None)
+    assert 'even' in reason
+    assert probe(str(video)).height == 360 and not list(tmp_path.glob('*.reencoding*'))
+
+def test_cli_apply(tmp_path, monkeypatch):
+    fresh_store(tmp_path, ROWS)
+    asked = stub_crop(monkeypatch)
+    r = CliRunner().invoke(app, ['borders', 'apply', str(tmp_path), '--only', 'a*', '--preset', 'ultrafast'])
+    assert r.exit_code == 0 and asked == ['a.mp4']
