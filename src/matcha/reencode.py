@@ -256,7 +256,7 @@ def run_reencode(
     bpps: str = '0.03,0.06,0.10',
     preview_dir: str | None = None,
     apply: bool = False,
-    preset: str = 'medium',
+    preset: str = 'fast',
     yes: bool = False,
     keep_originals: str | None = None,
 ) -> None:

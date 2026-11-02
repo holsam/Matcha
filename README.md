@@ -254,7 +254,7 @@ Separating the decisions from the file changes lets you review a whole library o
 | `--bpps` | `0.03,0.06,0.10` | bpp values to compare with `--preview` |
 | `--preview-dir` | `.matcha/tmp` | Where `--preview` writes |
 | `--apply` | off | Re-encode in place. Without it, `reencode` is a dry run |
-| `--preset` | `medium` | x265 preset, `ultrafast` to `veryslow`. Faster presets give larger files |
+| `--preset` | `fast` | x265 preset, `ultrafast` to `veryslow`. Faster presets give larger files |
 | `--yes` | off | Skip the confirmation prompt |
 | `--keep-originals` | none | Move originals to this directory, with a symlink to each new file, instead of deleting them |
 
@@ -321,7 +321,7 @@ Takes a video path. Saves a frame with the crop box drawn in red to `.matcha/tmp
 |--------|---------|-------------|
 | `--min-confidence` | `0.0` | Only crop videos where at least this share of frames agreed |
 | `--only` | none | Only crop videos whose path (relative to the directory) matches this glob |
-| `--preset` | `medium` | x265 preset, `ultrafast` to `veryslow` |
+| `--preset` | `fast` | x265 preset, `ultrafast` to `veryslow` |
 | `--keep-originals` | none | Move originals to this directory, with a symlink to each new file, instead of deleting them |
 
 ```sh

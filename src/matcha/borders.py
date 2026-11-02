@@ -411,7 +411,7 @@ def run_apply(
     *,
     min_confidence: float = 0.0,
     only: str | None = None,
-    preset: str = 'medium',
+    preset: str = 'fast',
     keep_originals: str | None = None,
     flush_every: float = 30.0,
 ) -> int:
