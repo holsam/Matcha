@@ -27,6 +27,7 @@ matcha plan     <directory>            Step through duplicate groups in the term
 matcha apply    <directory>            Apply a review plan: delete and rename files and update the index (dry run by default)
 matcha continue [directory] [command]  Re-run the last index or match command with the same configuration
 matcha reencode <directory>            Profile videos by codec and bitrate and re-encode bloated ones to HEVC (dry run by default)
+matcha borders  scan|list|preview|apply   Find videos with black borders, review the crop boxes and crop them in place
 
 ```
 
@@ -273,6 +274,72 @@ Estimates how much space re-encoding to HEVC would save from each file's bits pe
 With `--apply`, each candidate is encoded beside the original, checked (HEVC, same duration within a second, at least 10% smaller), then swapped in. Audio and subtitles are copied. Files in a container that cannot hold HEVC (avi, wmv, flv, webm) become `.mkv`, and the index is updated to match. Files are skipped, with a reason, when the encode or check fails, when the new name is already taken, or when the file has more than one video stream.
 
 **The original is deleted** once the new file verifies, unless `--keep-originals` is given. Stop `index`, `match` and `review` while applying.
+
+### `matcha borders`
+Four subcommands: `scan` finds videos with near-black letterbox, pillarbox or window-box borders and records a crop box for each, `list` shows them, `preview` draws a box on a frame, and `apply` crops the videos.
+
+#### `matcha borders scan`
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--workers` | `4` | Parallel scan workers |
+| `--rescan` | off | Scan every video again, even if up to date |
+| `--prune` | off | Forget stored videos that no longer exist |
+| `--flush-every` | `30` | Seconds between saves of `.matcha/borders.json` |
+| `--frames-a` / `--frames-b` | `5` / `20` | Frames in the quick pass and in the full pass |
+| `--agree-frac` | `0.8` | Share of informative frames that must agree on the same margins |
+| `--agree-px` | `2` | Margins agree when within this many pixels |
+| `--min-margin-frac` | `0.01` | Ignore margins smaller than this share of the frame |
+| `--black-tol`, `--max-black-ref`, `--blank-frac`, `--min-content-luma`, `--min-edge-step`, `--edge-band`, `--min-informative-a`, `--min-informative-b`, `--span-start`, `--span-end`, `--max-width` | see `--help` | Remaining detection thresholds |
+
+```sh
+# Scan a library (Ctrl+C is safe, re-run to resume)
+uv run matcha borders scan /path/to/Videos
+
+# Stricter agreement between frames
+uv run matcha borders scan /path/to/Videos --agree-frac 0.9
+```
+
+#### `matcha borders list`
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--include-variable` | off | Also list videos whose borders vary, for review |
+| `--min-confidence` | `0.0` | Minimum share of frames that agreed |
+| `--sort` | `path` | `path`, `confidence` or `area` (pixels removed) |
+| `--json` | off | Print JSON instead of a table |
+
+#### `matcha borders preview`
+Takes a video path. Saves a frame with the crop box drawn in red to `.matcha/tmp/borders_<name>.png` and prints the path.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--at` | auto | Seconds into the video. By default a representative frame near the middle |
+| `--out` | `.matcha/tmp` | Image to write |
+| `--detect` | off | Detect afresh with default thresholds instead of using the stored result |
+
+#### `matcha borders apply`
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--min-confidence` | `0.0` | Only crop videos where at least this share of frames agreed |
+| `--only` | none | Only crop videos whose path (relative to the directory) matches this glob |
+| `--preset` | `medium` | x265 preset, `ultrafast` to `veryslow` |
+| `--keep-originals` | none | Move originals to this directory, with a symlink to each new file, instead of deleting them |
+
+```sh
+# Look at what would be cropped, then crop it
+uv run matcha borders list /path/to/Videos --sort area
+uv run matcha borders preview /path/to/Videos/film.mkv
+uv run matcha borders apply /path/to/Videos --min-confidence 0.9 --keep-originals /path/to/Held
+```
+#### Explanation
+`scan` samples greyscale frames with ffmpeg across 5% to 95% of each video. A row or column is blank when at least 95% of its pixels are near-black, so a small watermark over a border does not hide it. The black level is estimated per frame, so limited and full range video both work. A frame only counts when its picture is reasonably bright and there is a sharp brightness step at the edge, which discards dark scenes and fades.
+
+Each video gets one result. `border` needs at least 80% of informative frames to agree within 2 pixels, with agreeing frames in both the first and last thirds, so a short window-boxed segment does not flag a video. `no border` means the frames agree there is none. `variable` means they disagree and is listed for review but never cropped. `insufficient` means too few frames were usable, for example a very dark video. A quick pass of 5 frames finishes most borderless videos, and only the rest get the full 20. Videos are rescanned when their size, modification time or the detection thresholds change.
+
+Results are kept in `.matcha/borders.json`, separate from the index, and saved atomically so an interruption never corrupts it.
+
+`apply` crops each stored `border` video in place and re-encodes it to HEVC at the source's bits per pixel, adjusted for the codec. It uses the same encode, check and swap steps as `reencode`: audio and subtitles are copied, containers that cannot hold HEVC become `.mkv`, and the index is updated. The result is checked for HEVC, the same duration and the exact cropped size. Videos changed since the scan are skipped. After cropping, the store entry becomes `no border` with an `applied` record.
+
+**There is no dry run, and the original is deleted** once the new file verifies, unless `--keep-originals` is given. Use `list` and `preview` first. Keep the `--keep-originals` directory outside the scanned directory, or a later `scan` will flag the held originals again.
 
 ### `matcha continue`
 #### CLI options and usage

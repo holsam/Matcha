@@ -165,9 +165,11 @@ def _target(path: str) -> str:
     return path if ext.lower() in _HEVC_OK else root + '.mkv'
 
 # _encode: re-encode to tmp at bpp keeping audio and subtitles, returns ffmpeg's last error line or None on success
-def _encode(i: Info, tmp: str, bpp: float, preset: str) -> str | None:
-    rate = int(i.width * i.height * i.fps * bpp)
+# vf adds a video filter (such as a crop) and rate overrides the bitrate derived from bpp
+def _encode(i: Info, tmp: str, bpp: float, preset: str, *, vf: str | None = None, rate: int | None = None) -> str | None:
+    rate = rate or int(i.width * i.height * i.fps * bpp)
     cmd = ['ffmpeg', '-v', 'error', '-y', '-i', i.path, '-map', '0:v:0', '-map', '0:a?', '-map', '0:s?',
+           *(['-vf', vf] if vf else []),
            '-c', 'copy', '-c:v', 'libx265', '-preset', preset, '-b:v', str(rate), '-x265-params', 'log-level=error']
     if os.path.splitext(tmp)[1].lower() in _APPLE_TAG:
         cmd += ['-tag:v', 'hvc1']
@@ -196,28 +198,32 @@ def _reencode_one(i: Info, db_path: str | None, bpp: float, preset: str, held: s
         if reason:
             return 0, reason
         saved = i.size - os.path.getsize(tmp)
-        st = os.stat(i.path)
-        if held:
-            os.makedirs(os.path.dirname(held), exist_ok=True)
-            shutil.move(i.path, held)  # copies across filesystems
-        try:
-            os.replace(tmp, dst)
-        except OSError:
-            if held:
-                shutil.move(held, i.path)  # put the original back
-            raise
-        if held:
-            os.symlink(dst, f'{os.path.splitext(held)[0]}.reencoded{os.path.splitext(dst)[1]}')
-        elif dst != i.path:
-            os.remove(i.path)
-        os.utime(dst, (st.st_atime, st.st_mtime))
-        if db_path:
-            # same path too: content_key hashes the old size
-            repoint_video(db_path, i.path, dst)
+        _swap_in(i.path, tmp, dst, held, db_path)
         return saved, ''
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+# _swap_in: replace the file at src with tmp (as dst), keeping its times; the original is held or deleted, the index follows
+def _swap_in(src: str, tmp: str, dst: str, held: str | None, db_path: str | None) -> None:
+    st = os.stat(src)
+    if held:
+        os.makedirs(os.path.dirname(held), exist_ok=True)
+        shutil.move(src, held)  # copies across filesystems
+    try:
+        os.replace(tmp, dst)
+    except OSError:
+        if held:
+            shutil.move(held, src)  # put the original back
+        raise
+    if held:
+        os.symlink(dst, f'{os.path.splitext(held)[0]}.reencoded{os.path.splitext(dst)[1]}')
+    elif dst != src:
+        os.remove(src)
+    os.utime(dst, (st.st_atime, st.st_mtime))
+    if db_path:
+        # same path too: content_key hashes the old size
+        repoint_video(db_path, src, dst)
 
 # _precheck: why this file must be skipped before any work is done, or None
 def _precheck(i: Info, dst: str, held: str | None) -> str | None:
