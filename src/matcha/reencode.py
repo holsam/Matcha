@@ -5,9 +5,11 @@ MATCHA: profile a library by codec and bitrate, and re-encode bloated videos to 
 # Import external dependencies
 import os, random, shlex, shutil, subprocess, tempfile, time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Callable
+import psutil
 from PIL import Image, ImageDraw, ImageFont
 from rich.console import Console
 from rich.markup import escape
@@ -206,6 +208,32 @@ def _file_task(progress: Progress, label: str, verbose: bool) -> tuple[TaskID, W
         progress.console.print(escape(cmd), style='dim')
     return task, Watch(update, echo if verbose else None)
 
+# _CPU_BUSY: cpu percent above which no further job is started
+_CPU_BUSY = 75.0
+
+# _MEM_FLOOR: available bytes below which no further job is started
+_MEM_FLOOR = 2 * 2**30
+
+# adaptive_map: run fn over items with up to max_jobs threads, yielding (item, result) as each finishes
+# starts at one job and adds another every settle seconds while cpu and memory have headroom, so a saturating x265 stays at one
+def adaptive_map[T, R](items: list[T], fn: Callable[[T], R], max_jobs: int, *, settle: float = 15.0) -> Iterator[tuple[T, R]]:
+    queue = list(reversed(items))
+    limit, last_change = 1, time.monotonic()
+    psutil.cpu_percent()  # first call only primes the counter
+    with ThreadPoolExecutor(max(1, max_jobs)) as ex:
+        running: dict[Future[R], T] = {}
+        while queue or running:
+            while queue and len(running) < limit:
+                item = queue.pop()
+                running[ex.submit(fn, item)] = item
+            done, _ = wait(running, timeout=1.0, return_when=FIRST_COMPLETED)
+            for f in done:
+                yield running.pop(f), f.result()
+            if queue and limit < max_jobs and len(running) >= limit and time.monotonic() - last_change >= settle:
+                if psutil.cpu_percent() < _CPU_BUSY and psutil.virtual_memory().available > _MEM_FLOOR:
+                    limit += 1
+                last_change = time.monotonic()
+
 # _summary: one result line for a finished file
 def _summary(name: str, before: int, after: int, seconds: float) -> str:
     pct = (1 - after / before) * 100 if before else 0.0
@@ -340,6 +368,7 @@ def run_reencode(
     keep_originals: str | None = None,
     verbose: bool = False,
     encoder: str = 'x265',
+    jobs: int = 1,
 ) -> None:
     check_encoder(encoder)
     directory = os.path.abspath(directory)
@@ -374,17 +403,21 @@ def run_reencode(
     saved = done = 0
     with _progress(console) as progress:
         overall = progress.add_task('Re-encoding'.ljust(40), total=len(cands), stats='')
-        for n, (_, i) in enumerate(cands):
+        def work(c: tuple[int, Info]) -> tuple[int, str, float]:
+            i = c[1]
             held = os.path.join(keep, os.path.relpath(i.path, directory)) if keep else None
             task, watch = _file_task(progress, os.path.relpath(i.path, directory), verbose)
             start = time.monotonic()
-            gained, reason = _reencode_one(i, db_path, bpp, preset, held, watch, encoder=encoder)
-            progress.remove_task(task)
+            try:
+                return *_reencode_one(i, db_path, bpp, preset, held, watch, encoder=encoder), time.monotonic() - start
+            finally:
+                progress.remove_task(task)
+        for n, ((_, i), (gained, reason, secs)) in enumerate(adaptive_map(cands, work, jobs)):
             progress.update(overall, advance=1, stats=f'{n + 1}/{len(cands)} files')
             saved += gained
             done += bool(gained)
             if reason:
                 progress.console.print(escape(f'skipped {i.path}: {reason}'), style='yellow')
             else:
-                progress.console.print(escape(_summary(os.path.relpath(i.path, directory), i.size, i.size - gained, time.monotonic() - start)))
+                progress.console.print(escape(_summary(os.path.relpath(i.path, directory), i.size, i.size - gained, secs)))
     console.print(f'[bold green]{human_size(saved)}[/] saved across {done}/{len(cands)} files')
