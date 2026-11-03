@@ -301,3 +301,23 @@ def test_hevc_already_at_the_target_bpp_is_not_a_candidate():
 def test_hevc_above_the_target_bpp_is_a_candidate():
     fat = replace(H264, codec='hevc')
     assert [i for _, i in _candidates([fat], 0.06, min_saving_pct=1, min_saving_mb=1)] == [fat]
+
+# test_adaptive_map_ramps_and_returns_all: every item comes back, and idle headroom lets jobs overlap
+def test_adaptive_map_ramps_and_returns_all(monkeypatch):
+    import threading, time
+    from matcha import reencode
+    monkeypatch.setattr(reencode.psutil, 'cpu_percent', lambda *a, **k: 5.0)
+    live = peak = 0
+    lock = threading.Lock()
+    def fn(x):
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        time.sleep(1.5)
+        with lock:
+            live -= 1
+        return x * 2
+    out = dict(reencode.adaptive_map([1, 2, 3, 4], fn, 3, settle=0.1))
+    assert out == {1: 2, 2: 4, 3: 6, 4: 8}
+    assert peak > 1

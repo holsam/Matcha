@@ -20,7 +20,7 @@ from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn
 # Import internal matcha objects
 from matcha.db import fold_in_moved_paths
 from matcha.indexer import find_videos
-from matcha.reencode import _CODEC_SCALE, _DEFAULT_SCALE, Info, Watch, _encode, _file_task, _info, _precheck, _progress, _summary, _swap_in, _target, check_encoder
+from matcha.reencode import adaptive_map, _CODEC_SCALE, _DEFAULT_SCALE, Info, Watch, _encode, _file_task, _info, _precheck, _progress, _summary, _swap_in, _target, check_encoder
 from matcha.review.media import human_size
 
 # _TIMEOUT: seconds before a slow disk or corrupt file is given up on
@@ -418,6 +418,7 @@ def run_apply(
     flush_every: float = 30.0,
     verbose: bool = False,
     encoder: str = 'x265',
+    jobs: int = 1,
 ) -> int:
     check_encoder(encoder)
     console = Console()
@@ -452,17 +453,21 @@ def run_apply(
     try:
         with _progress(console) as progress:
             overall = progress.add_task('Cropping'.ljust(40), total=len(todo), stats='')
-            for n, (rel, path, e) in enumerate(todo):
+            def work(t: tuple[str, str, dict]) -> tuple[str, tuple[int, int], str, float]:
+                rel, path, e = t
                 held = os.path.join(keep, rel) if keep else None
                 task, watch = _file_task(progress, rel, verbose)
                 start = time.monotonic()
-                new_path, sizes, reason = _crop_one(path, Crop(**e['crop']), preset, held, db_path, watch, encoder=encoder)
-                progress.remove_task(task)
+                try:
+                    return *_crop_one(path, Crop(**e['crop']), preset, held, db_path, watch, encoder=encoder), time.monotonic() - start
+                finally:
+                    progress.remove_task(task)
+            for n, ((rel, path, e), (new_path, sizes, reason, secs)) in enumerate(adaptive_map(todo, work, jobs)):
                 progress.update(overall, advance=1, stats=f'{n + 1}/{len(todo)} files')
                 if reason:
                     progress.console.print(escape(f'skipped {rel}: {reason}'), style='yellow')
                     continue
-                progress.console.print(escape(_summary(rel, sizes[0], sizes[1], time.monotonic() - start)))
+                progress.console.print(escape(_summary(rel, sizes[0], sizes[1], secs)))
                 new_rel = os.path.relpath(new_path, root)
                 st = os.stat(new_path)
                 if new_rel != rel:
